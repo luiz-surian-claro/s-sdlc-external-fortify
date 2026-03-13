@@ -368,6 +368,24 @@ foreach ($RepoUrl in $RepoList) {
     }
 
     Write-LogInfo "Scan SAST iniciado com sucesso para $RepoName"
+
+    # ========================================================================
+    # 5. Iniciar scan SCA (OSS)
+    # ========================================================================
+
+    Write-LogInfo "Iniciando scan SCA (Open Source) no release $ReleaseId..."
+
+    & $Fcli fod oss-scan start `
+        --rel $ReleaseId `
+        -f $ZipFile `
+        --store "oss_scan_$RepoVarName" | Out-Host
+
+    if ($LASTEXITCODE -ne 0) {
+        Write-LogError "Falha ao iniciar scan SCA (OSS) para $RepoName"
+        continue
+    }
+
+    Write-LogInfo "Scan SCA (OSS) iniciado com sucesso para $RepoName"
     Write-LogInfo "Acompanhe em: $FOD_URL/Redirect/Releases/$ReleaseId"
 
     Write-LogInfo "Processamento de $RepoName finalizado"
