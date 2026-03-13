@@ -9,4 +9,4 @@
 *.log
 
 # Lista de repositorios
-repo_list.txt
+repo_list*.txt
