@@ -53,7 +53,7 @@ FCLI_VERSION=v3.14.3
 ```
 
 | Variável | Obrigatória | Descrição |
-|---|---|---|
+| --- | --- | --- |
 | `FOD_URL` | Sim | URL base da API do Fortify on Demand |
 | `FOD_CLIENT_ID` | Sim | Client ID da conta de serviço FoD |
 | `FOD_CLIENT_SECRET` | Sim | Client Secret da conta de serviço FoD |
@@ -98,7 +98,7 @@ https://gitlab.exemplo.com.br/grupo/repo-c.git
 
 ## Estrutura de diretórios gerada
 
-```
+```text
 .tools/     # fcli baixado automaticamente (ignorado pelo git)
 .work/      # ZIPs dos repositórios gerados durante a execução (ignorado pelo git)
 .env        # Variáveis de configuração (ignorado pelo git)
