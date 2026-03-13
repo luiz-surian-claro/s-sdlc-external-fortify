@@ -6,5 +6,8 @@
         "Netskope",
         "sast",
         "sdlc"
-    ]
+    ],
+    "chat.tools.terminal.autoApprove": {
+        "fcli": true
+    }
 }
