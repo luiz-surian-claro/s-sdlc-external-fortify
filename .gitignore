@@ -7,3 +7,6 @@
 
 # Arquivos de log
 *.log
+
+# Lista de repositorios
+repo_list.txt
