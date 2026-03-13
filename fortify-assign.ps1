@@ -103,7 +103,7 @@ Write-LogStep "Preparando fcli"
 New-Item -ItemType Directory -Path $ToolsDir -Force | Out-Null
 
 $Fcli = $null
-$FcliExeName = if ($IsLinux -or $IsMacOS) { 'fcli' } else { 'fcli.exe' }
+$FcliExeName = if ((Test-Path variable:IsLinux) -and $IsLinux -or (Test-Path variable:IsMacOS) -and $IsMacOS) { 'fcli' } else { 'fcli.exe' }
 
 $FcliInPath = Get-Command $FcliExeName -ErrorAction SilentlyContinue
 if ($FcliInPath) {
@@ -123,7 +123,7 @@ if (-not $Fcli) {
     Write-LogInfo "fcli nao encontrado. Baixando versao $FCLI_VERSION..."
 
     $FcliBaseUrl = "https://github.com/fortify/fcli/releases/download/$FCLI_VERSION"
-    $FcliArchive = if ($IsLinux) { 'fcli-linux.tgz' } elseif ($IsMacOS) { 'fcli-mac.tgz' } else { 'fcli-windows.zip' }
+    $FcliArchive = if ((Test-Path variable:IsLinux) -and $IsLinux) { 'fcli-linux.tgz' } elseif ((Test-Path variable:IsMacOS) -and $IsMacOS) { 'fcli-mac.tgz' } else { 'fcli-windows.zip' }
     $FcliArchivePath = Join-Path $ToolsDir $FcliArchive
 
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -164,14 +164,30 @@ if ($LASTEXITCODE -ne 0) {
 Write-LogInfo "Conectado ao FoD com sucesso"
 
 # ============================================================================
+# RESOLVER USERID NUMERICO
+# ============================================================================
+
+Write-LogInfo "Buscando userId para '$AssignUser'..."
+
+$AssignUserId = (& $Fcli fod rest call "/api/v3/users?filters=userName:$AssignUser" --no-paging -o json |
+    Out-String | ConvertFrom-Json | Select-Object -First 1).userId
+
+if (-not $AssignUserId) {
+    Write-LogError "Usuario '$AssignUser' nao encontrado no FoD"
+    & $Fcli fod session logout 2>$null
+    exit 1
+}
+
+Write-LogInfo "UserId resolvido: $AssignUserId"
+
+# ============================================================================
 # LISTAR RELEASES DA APPLICATION
 # ============================================================================
 
 Write-LogStep "Listando releases da Application $FOD_APPLICATION_ID"
 
 $releases = & $Fcli fod release list --app $FOD_APPLICATION_ID -o json |
-    ConvertFrom-Json |
-    Select-Object -ExpandProperty value
+    Out-String | ConvertFrom-Json
 
 if (-not $releases -or $releases.Count -eq 0) {
     Write-LogWarn "Nenhuma release encontrada para Application $FOD_APPLICATION_ID"
@@ -185,19 +201,22 @@ Write-LogInfo "Releases encontradas: $($releases.Count)"
 # CONTADORES GLOBAIS
 # ============================================================================
 
-$totalReleases    = 0
-$totalVulns       = 0
-$totalAtribuidas  = 0
+$totalReleases         = 0
+$totalReleasesComVulns = 0
+$totalVulns            = 0
+$totalAtribuidas       = 0
 
 # ============================================================================
 # PROCESSAR CADA RELEASE
 # ============================================================================
 
 foreach ($release in $releases) {
-    $releaseId   = $release.id
-    $releaseName = $release.name
+    $releaseId   = $release.releaseId
+    $releaseName = $release.releaseName
 
     Write-LogStep "Release: $releaseName (ID: $releaseId)"
+
+    $totalReleases++
 
     # -------------------------------------------------------------------------
     # Listar todas as vulnerabilidades visíveis da release
@@ -205,16 +224,15 @@ foreach ($release in $releases) {
 
     Write-LogInfo "Buscando vulnerabilidades..."
 
-    $vulns = & $Fcli fod issue list --rel $releaseId -o json |
-        ConvertFrom-Json |
-        Select-Object -ExpandProperty value
+    $vulns = (& $Fcli fod issue list --rel $releaseId -o json | Out-String) |
+        ConvertFrom-Json
 
     if (-not $vulns -or $vulns.Count -eq 0) {
         Write-LogInfo "Nenhuma vulnerabilidade encontrada. Pulando..."
         continue
     }
 
-    $vulnIds = $vulns | Select-Object -ExpandProperty vulnId
+    $vulnIds = $vulns | Select-Object -ExpandProperty id
     Write-LogInfo "Vulnerabilidades encontradas: $($vulnIds.Count)"
 
     # -------------------------------------------------------------------------
@@ -233,15 +251,16 @@ foreach ($release in $releases) {
 
     foreach ($batch in $batches) {
         $bodyObj = [ordered]@{
-            vulnIds            = @($batch)
-            assignedUser       = $AssignUser
-            userAssignmentType = 'SpecificUser'
+            userId            = $AssignUserId
+            vulnerabilityIds  = @($batch)
+            attributes        = @()
         }
         $bodyJson = $bodyObj | ConvertTo-Json -Compress
 
-        & $Fcli fod rest call "/api/v3/releases/$releaseId/vulnerabilities/audit" `
-            -X PUT `
-            -d $bodyJson | Out-Null
+        & $Fcli fod rest call "/api/v3/releases/$releaseId/vulnerabilities/bulk-edit" `
+            -X POST `
+            -d $bodyJson `
+            --no-paging | Out-Null
 
         if ($LASTEXITCODE -ne 0) {
             Write-LogError "Falha ao atualizar lote para release '$releaseName'. Pulando lote..."
@@ -253,7 +272,7 @@ foreach ($release in $releases) {
 
     Write-LogInfo "Atribuicao concluida: $updated/$($vulnIds.Count) vulnerabilidades"
 
-    $totalReleases++
+    $totalReleasesComVulns++
     $totalVulns       += $vulnIds.Count
     $totalAtribuidas  += $updated
 }
@@ -266,7 +285,7 @@ Write-LogStep "Resumo da execucao"
 
 Write-LogInfo "Application ID  : $FOD_APPLICATION_ID"
 Write-LogInfo "Usuario atribuido: $AssignUser"
-Write-LogInfo "Releases processadas: $totalReleases / $($releases.Count)"
+Write-LogInfo "Releases processadas: $totalReleases / $($releases.Count) ($totalReleasesComVulns com vulnerabilidades)"
 Write-LogInfo "Vulnerabilidades atribuidas: $totalAtribuidas / $totalVulns"
 
 Write-Host ""
