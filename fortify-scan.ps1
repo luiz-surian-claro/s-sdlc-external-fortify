@@ -334,28 +334,28 @@ foreach ($RepoUrl in $RepoList) {
     }
 
     # ========================================================================
-    # 3b. Configurar SAST se ainda nao configurado
+    # 3b. Configurar SAST + SCA se ainda nao configurado
     # ========================================================================
 
-    Write-LogInfo "Configurando SAST para release $ReleaseId..."
+    Write-LogInfo "Configurando SAST+SCA para release $ReleaseId..."
 
     & $Fcli fod sast-scan setup `
         --rel $ReleaseId `
         --assessment-type "Static Assessment" `
         --frequency Subscription `
         --audit-preference Automated `
-        --skip-if-exists | Out-Host
+        --oss | Out-Host
 
     if ($LASTEXITCODE -ne 0) {
-        Write-LogError "Falha ao configurar SAST para $RepoName"
+        Write-LogError "Falha ao configurar SAST+SCA para $RepoName"
         continue
     }
 
     # ========================================================================
-    # 4. Iniciar scan SAST
+    # 4. Iniciar scan SAST (inclui SCA pelo flag --oss configurado no setup)
     # ========================================================================
 
-    Write-LogInfo "Iniciando scan SAST no release $ReleaseId..."
+    Write-LogInfo "Iniciando scans SAST e SCA no release $ReleaseId..."
 
     & $Fcli fod sast-scan start `
         --rel $ReleaseId `
@@ -363,29 +363,11 @@ foreach ($RepoUrl in $RepoList) {
         --store "sast_scan_$RepoVarName" | Out-Host
 
     if ($LASTEXITCODE -ne 0) {
-        Write-LogError "Falha ao iniciar scan SAST para $RepoName"
+        Write-LogError "Falha ao iniciar scan SAST+SCA para $RepoName"
         continue
     }
 
-    Write-LogInfo "Scan SAST iniciado com sucesso para $RepoName"
-
-    # ========================================================================
-    # 5. Iniciar scan SCA (OSS)
-    # ========================================================================
-
-    Write-LogInfo "Iniciando scan SCA (Open Source) no release $ReleaseId..."
-
-    & $Fcli fod oss-scan start `
-        --rel $ReleaseId `
-        -f $ZipFile `
-        --store "oss_scan_$RepoVarName" | Out-Host
-
-    if ($LASTEXITCODE -ne 0) {
-        Write-LogError "Falha ao iniciar scan SCA (OSS) para $RepoName"
-        continue
-    }
-
-    Write-LogInfo "Scan SCA (OSS) iniciado com sucesso para $RepoName"
+    Write-LogInfo "Scans SAST e SCA iniciados com sucesso para $RepoName"
     Write-LogInfo "Acompanhe em: $FOD_URL/Redirect/Releases/$ReleaseId"
 
     Write-LogInfo "Processamento de $RepoName finalizado"
