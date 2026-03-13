@@ -1,0 +1,724 @@
+# Pipeline Gitlab - Integração com Opentext Fortify On Demand - Claro
+
+# ============================================================================
+# CONFIGURAÇÕES DE ENTRADA
+# ============================================================================
+spec:
+  inputs:
+    fod_release_id:
+      description: 'O ID do projeto cadastrado no Fortify on Demand.'
+      type: number
+    stage:
+      default: test
+      description: Build stage in which to run the jobs provided by this component
+      type: string
+    build-docker-image:
+      default: sapmachine:25-alpine
+      description: Allows for overriding the default Java OpenJDK 25 image used by various jobs provided by this component, for example to use an image from a custom image registry.
+    lightweight-docker-image:
+      default: alpine/curl:latest
+      description: Allows for overriding the default Alpine image used by various jobs provided by this component, for example to use an image from a custom image registry. NOTE - This image must have curl, tar, openssl, and zip pre-installed.
+    fcli-version:
+      default: 'v3.10.0'
+      description: Fcli version to install/use
+    debricked-version:
+      default: 'v2.6.7'
+      description: Debricked CLI version to install/use
+    generate-pdf-report:
+      default: true
+      type: boolean
+      description: Whether to generate and publish a PDF report.
+    critical-vulnerability-threshold:
+      default: 10
+      type: number
+      description: Maximum number of critical vulnerabilities allowed before failing the pipeline
+    fail-on-critical:
+      default: false
+      type: boolean
+      description: Whether to fail the pipeline if critical vulnerabilities exceed threshold
+    reports-access:
+      default: developer
+      options: [all,developer,none]
+      description: GitLab access level required for accessing reports
+    logs-access:
+      default: developer
+      options: [all,developer,none]
+      description: GitLab access level required for accessing logs
+    logs-expire-in:
+      default: 1 day
+      description: GitLab artifacts:expire_in value for log artifacts; as logs contain sensitive data, they should ideally be cleaned up as soon as possible
+    debug:
+      default: false
+      type: boolean
+      description: Whether to generate and collect debug logs; note that these may contain sensitive data like access tokens or credentials
+    enable-sca-scan:
+      default: true
+      type: boolean
+      description: Whether to run Debricked SCA scan in addition to SAST
+    cache-tools:
+      default: true
+      type: boolean
+      description: Whether to cache security tools to speed up pipeline
+
+---
+
+# ============================================================================
+# DEFINIÇÃO DE ESTÁGIOS
+# ============================================================================
+stages:
+  - prepare    # Preparação de ferramentas
+  - scan       # Execução de scans de segurança (SAST e SCA)
+  - report     # Geração e publicação de relatórios
+
+# ============================================================================
+# CONFIGURAÇÕES GLOBAIS
+# ============================================================================
+default:
+  tags:
+    - lapa
+  timeout: 5 hours
+
+# ============================================================================
+# VARIÁVEIS GLOBAIS
+# ============================================================================
+.fortify-ast-vars:
+  variables:
+    # Diretórios de código-fonte e artefatos
+    SOURCE_DIR: ${CI_PROJECT_DIR}
+    FORTIFY_DIR: ${CI_PROJECT_DIR}/fortify
+    FORTIFY_TOOLS_DIR: ${FORTIFY_DIR}/tools
+    FORTIFY_DATA_DIR: ${FORTIFY_DIR}/data
+    DEBRICKED_DIR: ${CI_PROJECT_DIR}/debricked
+    DEBRICKED_TOOLS_DIR: ${DEBRICKED_DIR}/tools
+    DEBRICKED_DATA_DIR: ${DEBRICKED_DIR}/data
+
+    # Logs
+    PREPARE_LOG: ${FORTIFY_DIR}/prepare.log
+
+    # fcli configuration
+    FCLI: ''
+    FCLI_VERSION: $[[ inputs.fcli-version ]]
+    FCLI_BASE_URL: https://github.com/fortify/fcli/releases/download/${FCLI_VERSION}
+    FCLI_TGZ_URL: ${FCLI_BASE_URL}/fcli-linux.tgz
+    FCLI_RSA_SHA256_URL: ${FCLI_BASE_URL}/fcli-linux.tgz.rsa_sha256
+
+    # Debricked CLI configuration
+    DEBRICKED_CLI: ''
+    DEBRICKED_VERSION: $[[ inputs.debricked-version ]]
+    DEBRICKED_TGZ_URL: https://github.com/debricked/cli/releases/download/${DEBRICKED_VERSION}/cli_linux_x86_64.tar.gz
+
+    # Fortify on Demand configuration
+    FOD_URL: 'https://ams.fortify.com'
+    FOD_CLIENT_ID: ${FOD_CLIENT_ID}
+    FOD_CLIENT_SECRET: ${FOD_CLIENT_SECRET}
+    FOD_RELEASE: $[[ inputs.fod_release_id ]]
+
+    # Debricked configuration
+    DEBRICKED_TOKEN: ${DEBRICKED_ACCESS_TOKEN}
+
+    # Scan configuration
+    DO_EXPORT: 'true'
+    DO_WAIT: 'true'
+    CRITICAL_THRESHOLD: $[[ inputs.critical-vulnerability-threshold ]]
+    FAIL_ON_CRITICAL: $[[ inputs.fail-on-critical ]]
+
+# ============================================================================
+# REGRAS DE EXECUÇÃO CONDICIONAL
+# ============================================================================
+.scan-rules:
+  rules:
+    # Executar em merge requests
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    # Executar em commits na branch principal
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    # Executar quando houver mudanças em código
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+      changes:
+        - "**/*.java"
+        - "**/*.py"
+        - "**/*.js"
+        - "**/*.ts"
+        - "**/*.go"
+        - "**/*.rb"
+        - "**/*.php"
+        - "**/*.cs"
+        - "**/pom.xml"
+        - "**/package.json"
+        - "**/requirements.txt"
+        - "**/build.gradle"
+        - "**/composer.json"
+    # Permitir execução manual
+    - when: manual
+      allow_failure: true
+
+# ============================================================================
+# CONFIGURAÇÃO DE CACHE
+# ============================================================================
+.cache-security-tools:
+  cache:
+    key:
+      files:
+        - .gitlab-ci.yml
+      prefix: security-tools-${FCLI_VERSION}-${DEBRICKED_VERSION}
+    paths:
+      - ${FORTIFY_TOOLS_DIR}/
+      - ${DEBRICKED_TOOLS_DIR}/
+    policy: pull-push
+
+# ============================================================================
+# CONFIGURAÇÃO DE RETRY
+# ============================================================================
+.retry-config:
+  retry:
+    max: 2
+    when:
+      - api_failure
+      - stuck_or_timeout_failure
+      - runner_system_failure
+      - scheduler_failure
+
+# ============================================================================
+# SCRIPTS REUTILIZÁVEIS
+# ============================================================================
+.install-prerequisites: &install-prerequisites |
+  # echo "[INFO] Instalando pré-requisitos do sistema..."
+  # apk add -U curl tar openssl zip 2>/dev/null || \
+  # apt-get update && apt-get install -y curl tar openssl zip 2>/dev/null || \
+  # echo "[WARN] Gerenciador de pacotes não encontrado, assumindo que ferramentas já estão disponíveis"
+  echo "[INFO] Assumindo que pré-requisitos do sistema já estão disponíveis (curl, tar, openssl, zip)"
+
+.validate-variables: &validate-variables |
+  echo "[INFO] Validando variáveis de ambiente..."
+  required_vars="FOD_RELEASE FOD_CLIENT_ID FOD_CLIENT_SECRET"
+  missing_vars=""
+  for var in $required_vars; do
+    eval value=\$$var
+    if [ -z "$value" ]; then
+      missing_vars="$missing_vars $var"
+    fi
+  done
+  if [ -n "$missing_vars" ]; then
+    echo "[ERROR] Variáveis obrigatórias não definidas:$missing_vars"
+    exit 1
+  fi
+  echo "[INFO] ✅ Todas as variáveis obrigatórias estão definidas"
+
+.log-pipeline-info: &log-pipeline-info |
+  echo "════════════════════════════════════════════════════════════════"
+  echo "📊 Informações da Pipeline"
+  echo "════════════════════════════════════════════════════════════════"
+  echo "🔹 Projeto: ${CI_PROJECT_NAME}"
+  echo "🔹 Branch: ${CI_COMMIT_BRANCH}"
+  echo "🔹 Commit: ${CI_COMMIT_SHORT_SHA}"
+  echo "🔹 Autor: ${GITLAB_USER_NAME}"
+  echo "🔹 Pipeline: ${CI_PIPELINE_URL}"
+  echo "🔹 FoD Release: ${FOD_RELEASE}"
+  echo "════════════════════════════════════════════════════════════════"
+
+# ============================================================================
+# STAGE: PREPARE
+# ============================================================================
+
+# Job consolidado de preparação de ferramentas de segurança
+prepare-security-tools:
+  stage: prepare
+  image: $[[ inputs.lightweight-docker-image ]]
+  extends:
+    - .fortify-ast-vars
+  cache:
+    - !reference [.cache-security-tools, cache]
+  needs: []
+  script:
+    - |
+      # Informações da pipeline
+      echo "════════════════════════════════════════════════════════════════"
+      echo "📊 Informações da Pipeline"
+      echo "════════════════════════════════════════════════════════════════"
+      echo "🔹 Projeto: ${CI_PROJECT_NAME}"
+      echo "🔹 Branch: ${CI_COMMIT_BRANCH}"
+      echo "🔹 Commit: ${CI_COMMIT_SHORT_SHA}"
+      echo "🔹 Autor: ${GITLAB_USER_NAME}"
+      echo "🔹 Pipeline: ${CI_PIPELINE_URL}"
+      echo "🔹 FoD Release: ${FOD_RELEASE}"
+      echo "════════════════════════════════════════════════════════════════"
+
+      # Instalar pré-requisitos
+      # echo "[INFO] Instalando pré-requisitos do sistema..."
+      # apk add -U curl tar openssl zip 2>/dev/null || \
+      # apt-get update && apt-get install -y curl tar openssl zip 2>/dev/null || \
+      # echo "[WARN] Gerenciador de pacotes não encontrado, assumindo que ferramentas já estão disponíveis"
+      echo "[INFO] Assumindo que pré-requisitos do sistema já estão disponíveis (curl, tar, openssl, zip)"
+
+      # Criar diretórios
+      mkdir -p "${FORTIFY_DIR}" "${FORTIFY_TOOLS_DIR}" "${FORTIFY_DATA_DIR}"
+      mkdir -p "${DEBRICKED_DIR}" "${DEBRICKED_TOOLS_DIR}" "${DEBRICKED_DATA_DIR}"
+
+      # ========================================================================
+      # Instalar fcli (Fortify)
+      # ========================================================================
+      echo "[INFO] Instalando Fortify CLI (fcli)..."
+      if [ -f "${FORTIFY_TOOLS_DIR}/fcli" ] && [ "$[[ inputs.cache-tools ]]" = "true" ]; then
+        echo "[INFO] ✅ fcli encontrado no cache"
+        FCLI=${FORTIFY_TOOLS_DIR}/fcli
+      else
+        echo "[INFO] Baixando fcli versão ${FCLI_VERSION}..."
+        FCLI=${FORTIFY_TOOLS_DIR}/fcli
+
+        # Download do fcli
+        curl -fsSL -o "fcli-linux.tgz" "${FCLI_TGZ_URL}" | tee -a ${PREPARE_LOG}
+
+        # Verificação de assinatura (se disponível)
+        if [ -n "${FCLI_RSA_SHA256_URL}" ]; then
+          echo "[INFO] Verificando assinatura do fcli..."
+          curl -fsSL -o "fcli-linux.tgz.rsa_sha256" "${FCLI_RSA_SHA256_URL}"
+          openssl dgst -sha256 -verify <(echo "-----BEGIN PUBLIC KEY-----
+      MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArij9U9yJVNc53oEMFWYp
+      NrXUG1UoRZseDh/p34q1uywD70RGKKWZvXIcUAZZwbZtCu4i0UzsrKRJeUwqanbc
+      woJvYanp6lc3DccXUN1w1Y0WOHOaBxiiK3B1TtEIH1cK/X+ZzazPG5nX7TSGh8Tp
+      /uxQzUFli2mDVLqaP62/fB9uJ2joX9Gtw8sZfuPGNMRoc8IdhjagbFkhFT7WCZnk
+      FH/4Co007lmXLAe12lQQqR/pOTeHJv1sfda1xaHtj4/Tcrq04Kx0ZmGAd5D9lA92
+      8pdBbzoe/mI5/Sk+nIY3AHkLXB9YAaKJf//Wb1yiP1/hchtVkfXyIaGM+cVyn7AN
+      VQIDAQAB
+      -----END PUBLIC KEY-----") -signature "fcli-linux.tgz.rsa_sha256" "fcli-linux.tgz"
+          echo "[INFO] ✅ Assinatura verificada com sucesso"
+        fi
+
+        # Extrair e configurar
+        tar -zxvOf fcli-linux.tgz fcli > ${FCLI}
+        chmod a+x ${FCLI}
+        echo "[INFO] ✅ fcli instalado com sucesso"
+      fi
+
+      # Verificar instalação
+      ${FCLI} -V | tee -a ${PREPARE_LOG}
+
+      # ========================================================================
+      # Instalar Debricked CLI (SCA)
+      # ========================================================================
+      if [ "$[[ inputs.enable-sca-scan ]]" = "true" ]; then
+        echo "[INFO] Instalando Debricked CLI..."
+        if [ -f "${DEBRICKED_TOOLS_DIR}/debricked" ] && [ "$[[ inputs.cache-tools ]]" = "true" ]; then
+          echo "[INFO] ✅ Debricked CLI encontrado no cache"
+          DEBRICKED_CLI=${DEBRICKED_TOOLS_DIR}/debricked
+        else
+          echo "[INFO] Baixando Debricked CLI versão ${DEBRICKED_VERSION}..."
+          DEBRICKED_CLI=${DEBRICKED_TOOLS_DIR}/debricked
+
+          # Download do Debricked CLI
+          curl -fsSL -o "debricked-cli.tar.gz" "${DEBRICKED_TGZ_URL}"
+
+          # Extrair e configurar
+          tar -zxvOf debricked-cli.tar.gz debricked > ${DEBRICKED_CLI}
+          chmod a+x ${DEBRICKED_CLI}
+          echo "[INFO] ✅ Debricked CLI instalado com sucesso"
+        fi
+
+        # Verificar instalação
+        ${DEBRICKED_CLI} --version | tee -a ${PREPARE_LOG}
+      else
+        echo "[INFO] ⏭️ Scan SCA desabilitado, pulando instalação do Debricked CLI"
+      fi
+
+      # Salvar caminhos das ferramentas
+      echo "FCLI=${FCLI}" > ${FORTIFY_TOOLS_DIR}/dotenv
+      echo "DEBRICKED_CLI=${DEBRICKED_CLI}" >> ${FORTIFY_TOOLS_DIR}/dotenv
+      echo "FCLI=${FCLI}" >> ${PREPARE_LOG}
+      echo "DEBRICKED_CLI=${DEBRICKED_CLI}" >> ${PREPARE_LOG}
+
+      # Copiar log de preparação
+      cp ${PREPARE_LOG} ${FORTIFY_DATA_DIR}/
+
+      echo "[INFO] ✅ Preparação concluída com sucesso"
+
+  artifacts:
+    access: none
+    when: always
+    expire_in: 1 day
+    paths:
+      - ${FORTIFY_DIR}
+      - ${DEBRICKED_DIR}
+    reports:
+      dotenv: ${FORTIFY_TOOLS_DIR}/dotenv
+
+# ============================================================================
+# STAGE: SCAN
+# ============================================================================
+
+# Job de scan SAST com Fortify
+sast-scan:
+  stage: scan
+  image: $[[ inputs.build-docker-image ]]
+  extends:
+    - .fortify-ast-vars
+    - .scan-rules
+    - .retry-config
+  needs:
+    - job: prepare-security-tools
+      artifacts: true
+  before_script:
+    - *validate-variables
+  script:
+    - |
+      cd ${FORTIFY_DATA_DIR}
+
+      # Registrar início do scan
+      START_TIME=$(date +%s)
+      echo "[INFO] ⏱️ Iniciando scan SAST às $(date '+%Y-%m-%d %H:%M:%S')"
+
+      # Informações da pipeline
+      echo "════════════════════════════════════════════════════════════════"
+      echo "📊 Informações da Pipeline"
+      echo "════════════════════════════════════════════════════════════════"
+      echo "🔹 Projeto: ${CI_PROJECT_NAME}"
+      echo "🔹 Branch: ${CI_COMMIT_BRANCH}"
+      echo "🔹 Commit: ${CI_COMMIT_SHORT_SHA}"
+      echo "🔹 Autor: ${GITLAB_USER_NAME}"
+      echo "🔹 Pipeline: ${CI_PIPELINE_URL}"
+      echo "🔹 FoD Release: ${FOD_RELEASE}"
+      echo "════════════════════════════════════════════════════════════════"
+
+      # Login no FoD
+      echo "[INFO] Conectando ao Fortify on Demand..."
+      set +x  # Desabilitar echo para proteger credenciais
+      if ! ${FCLI} fod session login --url "${FOD_URL}" --client-id "${FOD_CLIENT_ID}" --client-secret "${FOD_CLIENT_SECRET}"; then
+        echo "[ERROR] ❌ Falha ao conectar com Fortify on Demand"
+        exit 1
+      fi
+      set -x  # Reabilitar echo
+      echo "[INFO] ✅ Conectado ao FoD com sucesso"
+
+      # Instalar zip se necessário
+      # apk add --no-cache zip 2>/dev/null || apt-get update && apt-get install -y zip 2>/dev/null || echo "[INFO] zip já disponível"
+
+      # Criar pacote do código-fonte
+      echo "[INFO] 📦 Empacotando código-fonte..."
+      cd "${SOURCE_DIR}"
+      zip -r "${FORTIFY_DATA_DIR}/source-code.zip" . \
+        -x "*.git/*" \
+        -x "*/node_modules/*" \
+        -x "*/target/*" \
+        -x "*/build/*" \
+        -x "*/dist/*" \
+        -x "*/bin/*" \
+        -x "*/obj/*" \
+        -x "*/.gradle/*" \
+        -x "*/.mvn/*" \
+        -x "*/venv/*" \
+        -x "*/__pycache__/*" \
+        -x "*.pyc" \
+        -x "*.class" \
+        -x "*.log"
+      cd "${FORTIFY_DATA_DIR}"
+
+      # Verificar tamanho do pacote
+      ZIP_SIZE=$(du -h "${FORTIFY_DATA_DIR}/source-code.zip" | cut -f1)
+      echo "[INFO] 📊 Tamanho do pacote: ${ZIP_SIZE}"
+
+      # Iniciar scan SAST
+      echo "[INFO] 🔍 Iniciando análise SAST..."
+      ${FCLI} fod sast-scan start --release ${FOD_RELEASE} --file source-code.zip --store fod_sast_scan
+
+      # Aguardar conclusão do scan
+      if [ "${DO_WAIT}" = "true" ]; then
+        echo "[INFO] ⏳ Aguardando conclusão do scan..."
+        if ${FCLI} fod sast-scan wait-for ::fod_sast_scan::; then
+          echo "[INFO] ✅ Scan concluído com sucesso"
+        else
+          echo "[WARN] ⚠️ Timeout aguardando scan, mas upload foi iniciado"
+          echo "[INFO] 🔗 Acompanhe em: ${FOD_URL}/Redirect/Releases/${FOD_RELEASE}"
+        fi
+      fi
+
+      # Exportar resultados
+      if [ "${DO_EXPORT}" = "true" ]; then
+        echo "[INFO] 📄 Exportando resultados no formato GitLab..."
+        ${FCLI} fod action run gitlab-sast-report --release ${FOD_RELEASE} --file gl-fortify-sast.json
+        echo "[INFO] ✅ Resultados exportados"
+      fi
+
+      # Verificar vulnerabilidades críticas
+      echo "[INFO] 🔍 Verificando vulnerabilidades críticas..."
+      CRITICAL_COUNT=$(${FCLI} fod rest call "/api/v3/releases/${FOD_RELEASE}/vulnerabilities?filters=severityString:Critical" --query "totalCount" --output expr={} || echo "0")
+      echo "[INFO] 📊 Vulnerabilidades críticas encontradas: ${CRITICAL_COUNT}"
+
+      if [ "${CRITICAL_COUNT}" -gt 0 ]; then
+        echo "[WARN] ⚠️ ATENÇÃO: ${CRITICAL_COUNT} vulnerabilidades críticas encontradas!"
+
+        if [ "${FAIL_ON_CRITICAL}" = "true" ] && [ "${CRITICAL_COUNT}" -gt "${CRITICAL_THRESHOLD}" ]; then
+          echo "[ERROR] ❌ Pipeline falhou: ${CRITICAL_COUNT} vulnerabilidades críticas excedem o limite de ${CRITICAL_THRESHOLD}"
+          exit 1
+        fi
+      else
+        echo "[INFO] ✅ Nenhuma vulnerabilidade crítica encontrada"
+      fi
+
+      # Registrar fim do scan
+      END_TIME=$(date +%s)
+      DURATION=$((END_TIME - START_TIME))
+      DURATION_MIN=$((DURATION / 60))
+      DURATION_SEC=$((DURATION % 60))
+      echo "[INFO] ⏱️ Tempo de execução do scan: ${DURATION_MIN}m ${DURATION_SEC}s"
+
+  after_script:
+    - |
+      # Logout e limpeza
+      ${FCLI} fod session logout 2>/dev/null || true
+      rm -f ${FORTIFY_DATA_DIR}/source-code.zip 2>/dev/null || true
+
+      # Status final
+      if [ "$CI_JOB_STATUS" = "success" ]; then
+        echo "[INFO] ✅ Scan SAST concluído com sucesso"
+      else
+        echo "[ERROR] ❌ Scan SAST falhou - verifique os logs acima"
+      fi
+
+  artifacts:
+    access: $[[ inputs.reports-access ]]
+    when: always
+    expire_in: 7 days
+    paths:
+      - ${FORTIFY_DATA_DIR}/gl-fortify-sast.json
+    reports:
+      sast: ${FORTIFY_DATA_DIR}/gl-fortify-sast.json
+
+# Job de scan SCA com Debricked
+sca-scan:
+  stage: scan
+  image: $[[ inputs.lightweight-docker-image ]]
+  extends:
+    - .fortify-ast-vars
+    - .scan-rules
+    - .retry-config
+  needs:
+    - job: prepare-security-tools
+      artifacts: true
+  rules:
+    - if: '"$[[ inputs.enable-sca-scan ]]" == "true"'
+      when: on_success
+  script:
+    - |
+      cd ${DEBRICKED_DATA_DIR}
+
+      # Registrar início do scan
+      START_TIME=$(date +%s)
+      echo "[INFO] ⏱️ Iniciando scan SCA às $(date '+%Y-%m-%d %H:%M:%S')"
+
+      # Informações da pipeline
+      echo "════════════════════════════════════════════════════════════════"
+      echo "📊 Informações da Pipeline"
+      echo "════════════════════════════════════════════════════════════════"
+      echo "🔹 Projeto: ${CI_PROJECT_NAME}"
+      echo "🔹 Branch: ${CI_COMMIT_BRANCH}"
+      echo "🔹 Commit: ${CI_COMMIT_SHORT_SHA}"
+      echo "🔹 Autor: ${GITLAB_USER_NAME}"
+      echo "🔹 Pipeline: ${CI_PIPELINE_URL}"
+      echo "🔹 FoD Release: ${FOD_RELEASE}"
+      echo "════════════════════════════════════════════════════════════════"
+
+      # Verificar token
+      if [ -z "${DEBRICKED_TOKEN}" ]; then
+        echo "[ERROR] ❌ DEBRICKED_ACCESS_TOKEN não está definido"
+        exit 1
+      fi
+      echo "[INFO] ✅ Token Debricked configurado"
+
+      # Executar scan SCA
+      echo "[INFO] 🔍 Iniciando análise SCA com Debricked..."
+      ${DEBRICKED_CLI} scan ${SOURCE_DIR} \
+        --access-token="${DEBRICKED_TOKEN}" \
+        --repository-name="${CI_PROJECT_NAME}" \
+        --commit="${CI_COMMIT_SHA}" \
+        --branch="${CI_COMMIT_BRANCH}" \
+        --integration="gitlab" \
+        --no-resolve \
+        --json-output="${DEBRICKED_DATA_DIR}/sca-results.json"
+
+      # Gerar relatório no formato GitLab
+      echo "[INFO] 📄 Gerando relatório no formato GitLab..."
+      if ${DEBRICKED_CLI} report \
+        --format gitlab \
+        --output "${DEBRICKED_DATA_DIR}/gl-debricked-sca.json" 2>/dev/null; then
+        echo "[INFO] ✅ Relatório GitLab gerado"
+      else
+        echo "[WARN] ⚠️ Não foi possível gerar relatório GitLab, usando resultados JSON"
+      fi
+
+      # Registrar fim do scan
+      END_TIME=$(date +%s)
+      DURATION=$((END_TIME - START_TIME))
+      DURATION_MIN=$((DURATION / 60))
+      DURATION_SEC=$((DURATION % 60))
+      echo "[INFO] ⏱️ Tempo de execução do scan: ${DURATION_MIN}m ${DURATION_SEC}s"
+      echo "[INFO] ✅ Scan SCA concluído"
+
+  after_script:
+    - |
+      if [ "$CI_JOB_STATUS" = "success" ]; then
+        echo "[INFO] ✅ Scan SCA concluído com sucesso"
+      else
+        echo "[ERROR] ❌ Scan SCA falhou - verifique os logs acima"
+      fi
+
+  artifacts:
+    access: $[[ inputs.reports-access ]]
+    when: always
+    expire_in: 7 days
+    paths:
+      - ${DEBRICKED_DATA_DIR}/sca-results.json
+      - ${DEBRICKED_DATA_DIR}/gl-debricked-sca.json
+    reports:
+      dependency_scanning: ${DEBRICKED_DATA_DIR}/gl-debricked-sca.json
+
+# ============================================================================
+# STAGE: REPORT
+# ============================================================================
+
+# Job para gerar e publicar relatório PDF do FoD
+generate-pdf-report:
+  stage: report
+  image: $[[ inputs.lightweight-docker-image ]]
+  extends:
+    - .fortify-ast-vars
+    - .retry-config
+  needs:
+    - job: prepare-security-tools
+      artifacts: true
+    - job: sast-scan
+      artifacts: true
+  rules:
+    - if: '"$[[ inputs.generate-pdf-report ]]" == "true"'
+      when: on_success
+  script:
+    - |
+      echo "[INFO] 📊 Gerando relatório PDF do Fortify..."
+
+      # Login no FoD
+      set +x
+      ${FCLI} fod session login --url "${FOD_URL}" --client-id "${FOD_CLIENT_ID}" --client-secret "${FOD_CLIENT_SECRET}"
+      set -x
+
+      # Definir nome do relatório com timestamp
+      REPORT_NAME="${CI_PROJECT_NAME}_$(date +%Y%m%d_%H%M%S)"
+      echo "[INFO] 📝 Nome do relatório: ${REPORT_NAME}"
+
+      # Criar relatório PDF
+      echo "[INFO] 📄 Criando relatório PDF..."
+      ${FCLI} fod report create "${REPORT_NAME}" \
+        --format pdf \
+        --notes "Pipeline: ${CI_PIPELINE_ID} | Commit: ${CI_COMMIT_SHA} | Branch: ${CI_COMMIT_BRANCH}" \
+        --release ${FOD_RELEASE} \
+        --template StaticSummary \
+        --store fod_report
+
+      # Aguardar e baixar relatório
+      echo "[INFO] ⏳ Aguardando geração do relatório..."
+      RETRY_COUNT=0
+      MAX_RETRIES=20
+      SLEEP_INTERVAL=15
+
+      while [ ${RETRY_COUNT} -lt ${MAX_RETRIES} ]; do
+        if ${FCLI} fod report download --file="fortify_${REPORT_NAME}.pdf" ::fod_report:: 2>/dev/null; then
+          echo "[INFO] ✅ Relatório PDF baixado com sucesso!"
+          break
+        fi
+
+        RETRY_COUNT=$((RETRY_COUNT + 1))
+        if [ ${RETRY_COUNT} -lt ${MAX_RETRIES} ]; then
+          echo "[INFO] ⏳ Tentativa ${RETRY_COUNT}/${MAX_RETRIES} - aguardando ${SLEEP_INTERVAL}s..."
+          sleep ${SLEEP_INTERVAL}
+        else
+          echo "[WARN] ⚠️ Timeout após ${MAX_RETRIES} tentativas"
+          echo "[INFO] O relatório pode ainda estar sendo gerado no servidor FoD"
+        fi
+      done
+
+      # Verificar se o arquivo foi criado
+      if [ -f "fortify_${REPORT_NAME}.pdf" ]; then
+        PDF_SIZE=$(du -h "fortify_${REPORT_NAME}.pdf" | cut -f1)
+        echo "[INFO] 📊 Tamanho do relatório: ${PDF_SIZE}"
+        echo "[INFO] ✅ Relatório disponível para download nos artefatos"
+      else
+        echo "[ERROR] ❌ Arquivo PDF não encontrado"
+        exit 1
+      fi
+
+  after_script:
+    - ${FCLI} fod session logout 2>/dev/null || true
+
+  artifacts:
+    name: 'fortify-pdf-report-${CI_COMMIT_SHORT_SHA}'
+    access: $[[ inputs.reports-access ]]
+    expire_in: 30 days
+    paths:
+      - "fortify_*.pdf"
+
+# Job para coletar e publicar debug output (condicional)
+publish-debug-logs:
+  stage: report
+  image: $[[ inputs.lightweight-docker-image ]]
+  extends:
+    - .fortify-ast-vars
+  needs:
+    - job: sast-scan
+      artifacts: true
+      optional: true
+    - job: sca-scan
+      artifacts: true
+      optional: true
+  rules:
+    - if: '"$[[ inputs.debug ]]" == "true"'
+      when: always
+  script:
+    - |
+      echo "[INFO] 📋 Coletando logs de debug..."
+      mkdir -p "${FORTIFY_DATA_DIR}/debug-output"
+
+      # Coletar logs e artefatos de debug
+      echo "[INFO] Procurando arquivos de log e debug..."
+      for pattern in '*.log' 'package.zip' '*.fpr'; do
+        find "${FORTIFY_DATA_DIR}" -name "$pattern" -type f -print0 2>/dev/null | \
+          xargs -0r cp -t "${FORTIFY_DATA_DIR}/debug-output" 2>/dev/null || true
+      done
+
+      # Também coletar logs do Debricked se disponíveis
+      if [ -d "${DEBRICKED_DATA_DIR}" ]; then
+        find "${DEBRICKED_DATA_DIR}" -name "*.log" -type f -print0 2>/dev/null | \
+          xargs -0r cp -t "${FORTIFY_DATA_DIR}/debug-output" 2>/dev/null || true
+      fi
+
+      # Criar arquivo de informações da pipeline
+      cat > "${FORTIFY_DATA_DIR}/debug-output/pipeline-info.txt" <<EOF
+      Pipeline Debug Information
+      ==========================
+      Project: ${CI_PROJECT_NAME}
+      Pipeline ID: ${CI_PIPELINE_ID}
+      Commit SHA: ${CI_COMMIT_SHA}
+      Branch: ${CI_COMMIT_BRANCH}
+      Triggered by: ${GITLAB_USER_NAME}
+      Date: $(date '+%Y-%m-%d %H:%M:%S')
+      FoD Release: ${FOD_RELEASE}
+      EOF
+
+      echo "[INFO] ✅ Logs de debug coletados"
+      ls -lh "${FORTIFY_DATA_DIR}/debug-output"
+
+  artifacts:
+    name: 'fortify-debug-output-${CI_COMMIT_SHORT_SHA}'
+    access: $[[ inputs.logs-access ]]
+    expire_in: $[[ inputs.logs-expire-in ]]
+    when: always
+    paths:
+      - "${FORTIFY_DATA_DIR}/debug-output"
+
+# ============================================================================
+# JOB AUXILIAR: Limpeza de artefatos antigos (opcional, executado manualmente)
+# ============================================================================
+cleanup-old-artifacts:
+  stage: report
+  image: $[[ inputs.lightweight-docker-image ]]
+  rules:
+    - when: manual
+      allow_failure: true
+  script:
+    - echo "[INFO] 🧹 Este job deve ser executado manualmente para limpar artefatos antigos"
+    - echo "[INFO] Implemente lógica de limpeza conforme necessário"

@@ -1,0 +1,6 @@
+# Arquivos de ambiente com credenciais
+.env
+
+# Diretórios de trabalho do script
+.tools/
+.work/
