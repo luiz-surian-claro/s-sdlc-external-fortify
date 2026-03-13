@@ -49,6 +49,14 @@ set -a
 source "${ENV_FILE}"
 set +a
 
+# Bypass SSL para ambientes com SSL inspection (ex: Netskope)
+FOD_INSECURE="${FOD_INSECURE:-false}"
+CURL_INSECURE=""
+if [ "${FOD_INSECURE}" = "true" ]; then
+  log_warn "FOD_INSECURE=true: validação de certificado SSL desabilitada (bypass Netskope)."
+  CURL_INSECURE="-k"
+fi
+
 # Validar variáveis obrigatórias
 REQUIRED_VARS="FOD_URL FOD_CLIENT_ID FOD_CLIENT_SECRET FOD_APPLICATION_ID GITLAB_TOKEN FCLI_VERSION"
 MISSING=""
@@ -132,7 +140,7 @@ else
 
   FCLI_DOWNLOAD_URL="${FCLI_BASE_URL}/${FCLI_TGZ}"
 
-  curl -fsSL -o "${TOOLS_DIR}/${FCLI_TGZ}" "${FCLI_DOWNLOAD_URL}"
+  curl -fsSL ${CURL_INSECURE} -o "${TOOLS_DIR}/${FCLI_TGZ}" "${FCLI_DOWNLOAD_URL}"
 
   case "${FCLI_TGZ}" in
     *.tgz)
@@ -156,11 +164,16 @@ fi
 
 log_step "Conectando ao Fortify on Demand"
 
+INSECURE_ARG=""
+if [ "${FOD_INSECURE}" = "true" ]; then INSECURE_ARG="-k"; fi
+
 set +x
+# shellcheck disable=SC2086
 if ! "${FCLI}" fod session login \
   --url "${FOD_URL}" \
   --client-id "${FOD_CLIENT_ID}" \
-  --client-secret "${FOD_CLIENT_SECRET}"; then
+  --client-secret "${FOD_CLIENT_SECRET}" \
+  ${INSECURE_ARG}; then
   log_error "Falha ao conectar com Fortify on Demand"
   exit 1
 fi
@@ -184,92 +197,64 @@ get_or_create_release() {
   local release_name="$1"
   local release_id=""
 
-  log_info "Verificando se release '${release_name}' já existe na application ${FOD_APPLICATION_ID}..."
+  log_info "Verificando release '${release_name}' na application ${FOD_APPLICATION_ID}..."
 
-  # Tentar obter o release existente
-  release_id=$("${FCLI}" fod release list \
-    --app "${FOD_APPLICATION_ID}" \
-    --query "releaseName=='${release_name}'" \
-    --output expr="{releaseId}" 2>/dev/null | head -1 | tr -d '[:space:]') || true
+  # Verificar se ja existe
+  release_id=$("${FCLI}" fod release list --app "${FOD_APPLICATION_ID}" \
+    -q "releaseName=='${release_name}'" \
+    -o expr="{releaseId}" 2>/dev/null | head -1 | tr -d '[:space:]') || true
 
-  if [ -n "${release_id}" ] && [ "${release_id}" != "No" ] && [ "${release_id}" != "(null)" ] && echo "${release_id}" | grep -qE '^[0-9]+$'; then
+  if echo "${release_id}" | grep -qE '^[0-9]+$'; then
     log_info "Release existente encontrado: ID=${release_id}"
     echo "${release_id}"
     return 0
   fi
 
-  log_info "Release não encontrado. Criando release '${release_name}'..."
+  log_info "Release nao encontrado. Criando release '${release_name}'..."
 
-  "${FCLI}" fod release create "${release_name}" \
-    --app "${FOD_APPLICATION_ID}" \
+  "${FCLI}" fod release create "${FOD_APPLICATION_ID}:${release_name}" \
     --sdlc-status Development \
     --store new_release
 
   release_id=$("${FCLI}" fod release get ::new_release:: \
-    --output expr="{releaseId}" 2>/dev/null | head -1 | tr -d '[:space:]') || true
+    -o expr="{releaseId}" 2>/dev/null | head -1 | tr -d '[:space:]') || true
 
   if [ -z "${release_id}" ] || ! echo "${release_id}" | grep -qE '^[0-9]+$'; then
-    log_error "Falha ao obter ID do release criado para '${release_name}'"
+    log_error "Falha ao obter ID do release para '${release_name}'"
     return 1
   fi
 
-  log_info "Release criado com sucesso: ID=${release_id}"
+  log_info "Release criado: ID=${release_id}"
   echo "${release_id}"
 }
 
 for REPO_URL in "${REPOS[@]}"; do
   REPO_NAME="$(extract_repo_name "$REPO_URL")"
-  REPO_WORK="${WORK_DIR}/${REPO_NAME}"
+  REPO_VAR_NAME="$(echo "${REPO_NAME}" | tr -c 'a-zA-Z0-9_' '_')"
   ZIP_FILE="${WORK_DIR}/${REPO_NAME}.zip"
 
   log_step "Processando: ${REPO_NAME}"
 
   # ========================================================================
-  # 1. Clonar repositório
+  # 1. Baixar arquivo zip diretamente do GitLab
   # ========================================================================
 
-  log_info "Clonando ${REPO_URL}..."
+  log_info "Baixando arquivo do repositório ${REPO_URL}..."
 
-  rm -rf "${REPO_WORK}"
-
-  # Inserir token na URL para autenticação (se HTTPS)
-  AUTH_URL="${REPO_URL}"
-  if echo "${REPO_URL}" | grep -qE '^https?://'; then
-    AUTH_URL="$(echo "${REPO_URL}" | sed "s|://|://oauth2:${GITLAB_TOKEN}@|")"
-  fi
-
-  if ! git clone --depth 1 "${AUTH_URL}" "${REPO_WORK}" 2>&1; then
-    log_error "Falha ao clonar ${REPO_URL}. Pulando..."
-    continue
-  fi
-
-  log_info "Repositório clonado com sucesso"
-
-  # ========================================================================
-  # 2. Compactar em .zip
-  # ========================================================================
-
-  log_info "Compactando código-fonte em ${REPO_NAME}.zip..."
+  GITLAB_BASE="$(echo "${REPO_URL}" | grep -oE '^https?://[^/]+')"
+  PROJECT_PATH="$(echo "${REPO_URL}" | sed 's|.*://[^/]*/||; s|\.git$||')"
+  ENCODED_PATH="$(printf '%s' "${PROJECT_PATH}" | sed 's|/|%2F|g')"
+  ARCHIVE_URL="${GITLAB_BASE}/api/v4/projects/${ENCODED_PATH}/repository/archive.zip"
 
   rm -f "${ZIP_FILE}"
 
-  cd "${REPO_WORK}"
-  zip -r "${ZIP_FILE}" . \
-    -x ".git/*" \
-    -x "*/node_modules/*" \
-    -x "*/target/*" \
-    -x "*/build/*" \
-    -x "*/dist/*" \
-    -x "*/bin/*" \
-    -x "*/obj/*" \
-    -x "*/.gradle/*" \
-    -x "*/.mvn/*" \
-    -x "*/venv/*" \
-    -x "*/__pycache__/*" \
-    -x "*.pyc" \
-    -x "*.class" \
-    -x "*.log"
-  cd "${SCRIPT_DIR}"
+  if ! curl -fsSL ${CURL_INSECURE} \
+    -H "PRIVATE-TOKEN: ${GITLAB_TOKEN}" \
+    -o "${ZIP_FILE}" \
+    "${ARCHIVE_URL}"; then
+    log_error "Falha ao baixar zip de ${REPO_URL}. Pulando..."
+    continue
+  fi
 
   ZIP_SIZE=$(du -h "${ZIP_FILE}" | cut -f1)
   log_info "Pacote gerado: ${ZIP_FILE} (${ZIP_SIZE})"
@@ -286,28 +271,37 @@ for REPO_URL in "${REPOS[@]}"; do
   fi
 
   # ========================================================================
-  # 4. Iniciar scan SAST + SCA
+  # 3b. Configurar SAST se ainda nao configurado
+  # ========================================================================
+
+  log_info "Configurando SAST para release ${RELEASE_ID}..."
+
+  if ! "${FCLI}" fod sast-scan setup \
+    --rel "${RELEASE_ID}" \
+    --assessment-type "Static Assessment" \
+    --frequency Subscription \
+    --audit-preference Automated \
+    --skip-if-exists; then
+    log_error "Falha ao configurar SAST para ${REPO_NAME}. Pulando..."
+    continue
+  fi
+
+  # ========================================================================
+  # 4. Iniciar scan SAST
   # ========================================================================
 
   log_info "Iniciando scan SAST no release ${RELEASE_ID}..."
 
-  "${FCLI}" fod sast-scan start \
-    --release "${RELEASE_ID}" \
-    --file "${ZIP_FILE}" \
-    --store "sast_scan_${REPO_NAME}"
-
-  log_info "Scan SAST iniciado com sucesso para ${REPO_NAME}"
-
-  log_info "Aguardando conclusão do scan SAST..."
-  if "${FCLI}" fod sast-scan wait-for "::sast_scan_${REPO_NAME}::"; then
-    log_info "Scan SAST concluído para ${REPO_NAME}"
-  else
-    log_warn "Timeout aguardando scan SAST de ${REPO_NAME}"
-    log_info "Acompanhe em: ${FOD_URL}/Redirect/Releases/${RELEASE_ID}"
+  if ! "${FCLI}" fod sast-scan start \
+    --rel "${RELEASE_ID}" \
+    -f "${ZIP_FILE}" \
+    --store "sast_scan_${REPO_VAR_NAME}"; then
+    log_error "Falha ao iniciar scan SAST para ${REPO_NAME}. Pulando..."
+    continue
   fi
 
-  # Limpeza do clone
-  rm -rf "${REPO_WORK}"
+  log_info "Scan SAST iniciado com sucesso para ${REPO_NAME}"
+  log_info "Acompanhe em: ${FOD_URL}/Redirect/Releases/${RELEASE_ID}"
 
   log_info "Processamento de ${REPO_NAME} finalizado"
 done

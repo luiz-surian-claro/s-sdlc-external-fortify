@@ -89,6 +89,7 @@ $FOD_APPLICATION_ID = $EnvVars['FOD_APPLICATION_ID']
 $GITLAB_TOKEN       = $EnvVars['GITLAB_TOKEN']
 $GITLAB_URL         = $EnvVars['GITLAB_URL']
 $FCLI_VERSION       = $EnvVars['FCLI_VERSION']
+$FOD_INSECURE       = ($EnvVars['FOD_INSECURE'] -eq 'true')
 
 # Validar variáveis obrigatórias
 $RequiredVars = @('FOD_URL', 'FOD_CLIENT_ID', 'FOD_CLIENT_SECRET', 'FOD_APPLICATION_ID', 'GITLAB_TOKEN', 'FCLI_VERSION')
@@ -101,6 +102,12 @@ foreach ($var in $RequiredVars) {
 if ($Missing.Count -gt 0) {
     Write-LogError "Variaveis obrigatorias nao definidas no .env: $($Missing -join ', ')"
     exit 1
+}
+
+if ($FOD_INSECURE) {
+    Write-LogWarn "FOD_INSECURE=true: validacao de certificado SSL desabilitada (bypass Netskope)."
+    # Necessario para Invoke-WebRequest em PS 5.1 (nao suporta -SkipCertificateCheck)
+    [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
 }
 
 # ============================================================================
@@ -204,10 +211,14 @@ if (-not $Fcli) {
 
 Write-LogStep "Conectando ao Fortify on Demand"
 
-& $Fcli fod session login `
-    --url $FOD_URL `
-    --client-id $FOD_CLIENT_ID `
-    --client-secret $FOD_CLIENT_SECRET
+$LoginArgs = @(
+    'fod', 'session', 'login',
+    '--url', $FOD_URL,
+    '--client-id', $FOD_CLIENT_ID,
+    '--client-secret', $FOD_CLIENT_SECRET
+)
+
+& $Fcli @LoginArgs
 
 if ($LASTEXITCODE -ne 0) {
     Write-LogError "Falha ao conectar com Fortify on Demand"
@@ -237,54 +248,38 @@ function Get-RepoName {
 function Get-OrCreateRelease {
     param([string]$ReleaseName)
 
-    Write-LogInfo "Verificando se release '$ReleaseName' ja existe na application $FOD_APPLICATION_ID..."
+    Write-LogInfo "Verificando release '$ReleaseName' na application $FOD_APPLICATION_ID..."
 
-    # Tentar obter o release existente
-    $releaseId = $null
-    try {
-        $output = & $Fcli fod release list `
-            --app $FOD_APPLICATION_ID `
-            --query "releaseName=='$ReleaseName'" `
-            --output "expr={releaseId}" 2>&1
+    # Verificar se ja existe
+    $releaseId = (& $Fcli fod release list --app $FOD_APPLICATION_ID `
+        -q "releaseName=='$ReleaseName'" `
+        -o "expr={releaseId}" 2>&1 | Select-Object -First 1).ToString().Trim()
 
-        $candidate = ($output | Select-Object -First 1).ToString().Trim()
-
-        if ($candidate -match '^\d+$') {
-            $releaseId = $candidate
-            Write-LogInfo "Release existente encontrado: ID=$releaseId"
-            return $releaseId
-        }
-    } catch {
-        # Release não encontrado, prosseguir para criação
+    if ($releaseId -match '^\d+$') {
+        Write-LogInfo "Release existente encontrado: ID=$releaseId"
+        return $releaseId
     }
 
     Write-LogInfo "Release nao encontrado. Criando release '$ReleaseName'..."
 
-    & $Fcli fod release create $ReleaseName `
-        --app $FOD_APPLICATION_ID `
+    & $Fcli fod release create "${FOD_APPLICATION_ID}:${ReleaseName}" `
         --sdlc-status Development `
-        --store new_release
+        --store new_release | Out-Host
 
     if ($LASTEXITCODE -ne 0) {
         Write-LogError "Falha ao criar release '$ReleaseName'"
         return $null
     }
 
-    try {
-        $output = & $Fcli fod release get "::new_release::" `
-            --output "expr={releaseId}" 2>&1
+    $releaseId = (& $Fcli fod release get "::new_release::" `
+        -o "expr={releaseId}" 2>&1 | Select-Object -First 1).ToString().Trim()
 
-        $releaseId = ($output | Select-Object -First 1).ToString().Trim()
-
-        if ($releaseId -match '^\d+$') {
-            Write-LogInfo "Release criado com sucesso: ID=$releaseId"
-            return $releaseId
-        }
-    } catch {
-        # Falha ao obter ID
+    if ($releaseId -match '^\d+$') {
+        Write-LogInfo "Release criado: ID=$releaseId"
+        return $releaseId
     }
 
-    Write-LogError "Falha ao obter ID do release criado para '$ReleaseName'"
+    Write-LogError "Falha ao obter ID do release para '$ReleaseName'"
     return $null
 }
 
@@ -293,80 +288,37 @@ function Get-OrCreateRelease {
 # ============================================================================
 
 foreach ($RepoUrl in $RepoList) {
-    $RepoName = Get-RepoName $RepoUrl
-    $RepoWork = Join-Path $WorkDir $RepoName
-    $ZipFile  = Join-Path $WorkDir "$RepoName.zip"
+    $RepoName    = Get-RepoName $RepoUrl
+    $RepoVarName = $RepoName -replace '[^a-zA-Z0-9_]', '_'
+    $ZipFile     = Join-Path $WorkDir "$RepoName.zip"
 
     Write-LogStep "Processando: $RepoName"
 
     # ========================================================================
-    # 1. Clonar repositório
+    # 1. Baixar arquivo zip diretamente do GitLab
     # ========================================================================
 
-    Write-LogInfo "Clonando $RepoUrl..."
+    Write-LogInfo "Baixando arquivo do repositorio $RepoUrl..."
 
-    if (Test-Path $RepoWork) {
-        Remove-Item -Recurse -Force $RepoWork
-    }
+    $repoUri     = [Uri]$RepoUrl
+    $gitlabBase  = "$($repoUri.Scheme)://$($repoUri.Authority)"
+    $projectPath = $repoUri.AbsolutePath.TrimStart('/') -replace '\.git$', ''
+    $encodedPath = [Uri]::EscapeDataString($projectPath)
+    $archiveUrl  = "$gitlabBase/api/v4/projects/$encodedPath/repository/archive.zip"
 
-    # Inserir token na URL para autenticação (se HTTPS)
-    $AuthUrl = $RepoUrl
-    if ($RepoUrl -match '^https?://') {
-        $AuthUrl = $RepoUrl -replace '://', "://oauth2:${GITLAB_TOKEN}@"
-    }
+    if (Test-Path $ZipFile) { Remove-Item -Force $ZipFile }
 
-    & git clone --depth 1 $AuthUrl $RepoWork 2>&1
-
-    if ($LASTEXITCODE -ne 0) {
-        Write-LogError "Falha ao clonar $RepoUrl. Pulando..."
+    try {
+        Invoke-WebRequest -Uri $archiveUrl `
+            -Headers @{ 'PRIVATE-TOKEN' = $GITLAB_TOKEN } `
+            -OutFile $ZipFile `
+            -UseBasicParsing
+    } catch {
+        Write-LogError "Falha ao baixar zip de $RepoUrl. Pulando..."
         continue
     }
 
-    Write-LogInfo "Repositorio clonado com sucesso"
-
-    # ========================================================================
-    # 2. Compactar em .zip
-    # ========================================================================
-
-    Write-LogInfo "Compactando codigo-fonte em $RepoName.zip..."
-
-    if (Test-Path $ZipFile) {
-        Remove-Item -Force $ZipFile
-    }
-
-    # Diretórios e extensões a excluir
-    $ExcludeDirs = @('.git', 'node_modules', 'target', 'build', 'dist', 'bin', 'obj', '.gradle', '.mvn', 'venv', '__pycache__')
-    $ExcludeExts = @('.pyc', '.class', '.log')
-
-    # Coletar arquivos, excluindo diretórios e extensões indesejadas
-    $filesToZip = Get-ChildItem -Path $RepoWork -Recurse -File | Where-Object {
-        $relativePath = $_.FullName.Substring($RepoWork.Length + 1)
-        $pathParts = $relativePath -split '[/\\]'
-        $excluded = $false
-
-        foreach ($dir in $ExcludeDirs) {
-            if ($pathParts -contains $dir) {
-                $excluded = $true
-                break
-            }
-        }
-
-        if (-not $excluded) {
-            foreach ($ext in $ExcludeExts) {
-                if ($_.Extension -eq $ext) {
-                    $excluded = $true
-                    break
-                }
-            }
-        }
-
-        -not $excluded
-    }
-
-    # Usar Compress-Archive
-    $filesToZip | Compress-Archive -DestinationPath $ZipFile -Force
-
-    $ZipSize = (Get-Item $ZipFile).Length
+    $ZipSize   = (Get-Item $ZipFile).Length
     $ZipSizeMB = [math]::Round($ZipSize / 1MB, 2)
     Write-LogInfo "Pacote gerado: $ZipFile (${ZipSizeMB} MB)"
 
@@ -382,15 +334,33 @@ foreach ($RepoUrl in $RepoList) {
     }
 
     # ========================================================================
+    # 3b. Configurar SAST se ainda nao configurado
+    # ========================================================================
+
+    Write-LogInfo "Configurando SAST para release $ReleaseId..."
+
+    & $Fcli fod sast-scan setup `
+        --rel $ReleaseId `
+        --assessment-type "Static Assessment" `
+        --frequency Subscription `
+        --audit-preference Automated `
+        --skip-if-exists | Out-Host
+
+    if ($LASTEXITCODE -ne 0) {
+        Write-LogError "Falha ao configurar SAST para $RepoName"
+        continue
+    }
+
+    # ========================================================================
     # 4. Iniciar scan SAST
     # ========================================================================
 
     Write-LogInfo "Iniciando scan SAST no release $ReleaseId..."
 
     & $Fcli fod sast-scan start `
-        --release $ReleaseId `
-        --file $ZipFile `
-        --store "sast_scan_$RepoName"
+        --rel $ReleaseId `
+        -f $ZipFile `
+        --store "sast_scan_$RepoVarName" | Out-Host
 
     if ($LASTEXITCODE -ne 0) {
         Write-LogError "Falha ao iniciar scan SAST para $RepoName"
@@ -398,21 +368,7 @@ foreach ($RepoUrl in $RepoList) {
     }
 
     Write-LogInfo "Scan SAST iniciado com sucesso para $RepoName"
-
-    Write-LogInfo "Aguardando conclusao do scan SAST..."
-    & $Fcli fod sast-scan wait-for "::sast_scan_${RepoName}::"
-
-    if ($LASTEXITCODE -eq 0) {
-        Write-LogInfo "Scan SAST concluido para $RepoName"
-    } else {
-        Write-LogWarn "Timeout aguardando scan SAST de $RepoName"
-        Write-LogInfo "Acompanhe em: $FOD_URL/Redirect/Releases/$ReleaseId"
-    }
-
-    # Limpeza do clone
-    if (Test-Path $RepoWork) {
-        Remove-Item -Recurse -Force $RepoWork
-    }
+    Write-LogInfo "Acompanhe em: $FOD_URL/Redirect/Releases/$ReleaseId"
 
     Write-LogInfo "Processamento de $RepoName finalizado"
 }

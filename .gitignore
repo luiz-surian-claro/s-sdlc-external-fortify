@@ -4,3 +4,6 @@
 # Diretórios de trabalho do script
 .tools/
 .work/
+
+# Arquivos de log
+*.log
