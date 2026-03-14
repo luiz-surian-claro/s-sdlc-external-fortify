@@ -5,7 +5,7 @@
     FoD para um usuário específico.
 
 .DESCRIPTION
-    Para cada release da Application definida por FOD_APPLICATION_ID, lista
+    Para cada release da Application definida por FOD_APPLICATION_NAME, lista
     todas as vulnerabilidades visíveis e faz um bulk update via REST API para
     setar o "Assigned User" no FoD.
 

@@ -4,7 +4,7 @@
     Exclui todas as releases de uma Application no Fortify on Demand.
 
 .DESCRIPTION
-    Lista todas as releases da Application definida por FOD_APPLICATION_ID
+    Lista todas as releases da Application definida por FOD_APPLICATION_NAME
     e as exclui via fcli. Solicita confirmacao antes de prosseguir.
 
 .PARAMETER Force
