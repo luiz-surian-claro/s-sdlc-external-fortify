@@ -67,12 +67,18 @@ FOD_APPLICATION_NAME=<nome-da-application-no-fod>
 FOD_APP_TYPE=Web
 FOD_APP_CRITICALITY=High
 
+# SDLC Status das releases criadas
+FOD_SDLC_STATUS=Production
+
 # GitLab
 GITLAB_URL=https://gitlab.exemplo.com.br
 GITLAB_TOKEN=<seu-token-privado-gitlab>
 
 # Versão do fcli a baixar caso não esteja instalado
 FCLI_VERSION=v3.15.0
+
+# Usuário padrão para atribuição de vulnerabilidades (fortify-assign.ps1)
+FOD_ASSIGN_USER=
 
 # Opcional: desabilita validação de certificado SSL (ex.: bypass Netskope)
 # FOD_INSECURE=true
@@ -86,9 +92,11 @@ FCLI_VERSION=v3.15.0
 | `FOD_APPLICATION_NAME` | Sim | Nome da Application no FoD onde os releases serão criados |
 | `FOD_APP_TYPE` | Sim | Tipo da Application ao criar (valores: `Web`, `ThickClient`, `Mobile`, `Microservice`) |
 | `FOD_APP_CRITICALITY` | Sim | Criticidade de negócio ao criar a Application (valores: `High`, `Medium`, `Low`) |
+| `FOD_SDLC_STATUS` | Sim | Status SDLC das releases criadas (valores: `Development`, `QA`, `Production`, `Retired`) |
 | `GITLAB_TOKEN` | Sim | Personal/Project Access Token do GitLab |
 | `GITLAB_URL` | Não | URL base do GitLab (usado para resolver URLs relativas) |
 | `FCLI_VERSION` | Sim | Versão do fcli a baixar (ex.: `v3.15.0`) |
+| `FOD_ASSIGN_USER` | Não | Usuário padrão para atribuição de vulnerabilidades em `fortify-assign.ps1` |
 | `FOD_INSECURE` | Não | `true` para desabilitar validação SSL (bypass de proxy TLS) |
 
 ---

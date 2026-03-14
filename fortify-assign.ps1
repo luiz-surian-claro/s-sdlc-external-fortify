@@ -10,7 +10,7 @@
     setar o "Assigned User" no FoD.
 
 .PARAMETER AssignUser
-    Username do FoD para atribuição. Padrão: luiz.surian
+    Username do FoD para atribuição. Se não for fornecido, usa o valor de FOD_ASSIGN_USER do .env.
 
 .EXAMPLE
     .\fortify-assign.ps1
@@ -21,7 +21,7 @@
 
 [CmdletBinding()]
 param(
-    [string]$AssignUser = 'luiz.surian'
+    [string]$AssignUser = ''
 )
 
 Set-StrictMode -Version Latest
@@ -45,6 +45,10 @@ $ToolsDir  = Join-Path $ScriptDir '.tools'
 # ============================================================================
 
 Import-FodEnv -EnvFile $EnvFile
+
+if (-not $AssignUser) {
+    $AssignUser = $FOD_ASSIGN_USER
+}
 
 # ============================================================================
 # INSTALAR / LOCALIZAR fcli

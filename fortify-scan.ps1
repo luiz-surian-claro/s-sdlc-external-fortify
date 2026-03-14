@@ -48,7 +48,7 @@ $WorkDir   = Join-Path $ScriptDir '.work'
 # ============================================================================
 
 Import-FodEnv -EnvFile $EnvFile `
-    -RequiredVars @('FOD_URL', 'FOD_CLIENT_ID', 'FOD_CLIENT_SECRET', 'FOD_APPLICATION_NAME', 'FOD_APP_TYPE', 'FOD_APP_CRITICALITY', 'GITLAB_TOKEN', 'FCLI_VERSION')
+    -RequiredVars @('FOD_URL', 'FOD_CLIENT_ID', 'FOD_CLIENT_SECRET', 'FOD_APPLICATION_NAME', 'FOD_APP_TYPE', 'FOD_APP_CRITICALITY', 'FOD_SDLC_STATUS', 'GITLAB_TOKEN', 'FCLI_VERSION')
 
 # ============================================================================
 # MONTAR LISTA DE REPOSITÓRIOS
@@ -139,7 +139,7 @@ function Get-OrCreateRelease {
     Write-LogInfo "Release nao encontrado. Criando release '$ReleaseName'..."
 
     & $Fcli fod release create "${FOD_APPLICATION_NAME}:${ReleaseName}" `
-        --sdlc-status Development `
+        --sdlc-status $FOD_SDLC_STATUS `
         --app-type $FOD_APP_TYPE `
         --app-criticality $FOD_APP_CRITICALITY `
         --store new_release | Out-Host
