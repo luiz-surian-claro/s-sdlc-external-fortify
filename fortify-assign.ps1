@@ -38,130 +38,25 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $EnvFile   = Join-Path $ScriptDir '.env'
 $ToolsDir  = Join-Path $ScriptDir '.tools'
 
-# ============================================================================
-# FUNÇÕES AUXILIARES
-# ============================================================================
-
-function Write-LogInfo  { param([string]$Message) Write-Host "[INFO]  $Message" }
-function Write-LogWarn  { param([string]$Message) Write-Host "[WARN]  $Message" -ForegroundColor Yellow }
-function Write-LogError { param([string]$Message) Write-Host "[ERROR] $Message" -ForegroundColor Red }
-function Write-LogStep  { param([string]$Message)
-    Write-Host ""
-    Write-Host ("=" * 64)
-    Write-Host "  $Message"
-    Write-Host ("=" * 64)
-}
+. (Join-Path $ScriptDir 'fortify-common.ps1')
 
 # ============================================================================
 # CARREGAR .env
 # ============================================================================
 
-if (-not (Test-Path $EnvFile)) {
-    Write-LogError "Arquivo .env nao encontrado em: $EnvFile"
-    exit 1
-}
-
-$EnvVars = @{}
-Get-Content $EnvFile | ForEach-Object {
-    $line = $_.Trim()
-    if ($line -and -not $line.StartsWith('#')) {
-        $parts = $line -split '=', 2
-        if ($parts.Count -eq 2) {
-            $EnvVars[$parts[0].Trim()] = $parts[1].Trim()
-        }
-    }
-}
-
-$FOD_URL            = $EnvVars['FOD_URL']
-$FOD_CLIENT_ID      = $EnvVars['FOD_CLIENT_ID']
-$FOD_CLIENT_SECRET  = $EnvVars['FOD_CLIENT_SECRET']
-$FOD_APPLICATION_ID = $EnvVars['FOD_APPLICATION_ID']
-$FCLI_VERSION       = $EnvVars['FCLI_VERSION']
-$FOD_INSECURE       = ($EnvVars['FOD_INSECURE'] -eq 'true')
-
-$RequiredVars = @('FOD_URL', 'FOD_CLIENT_ID', 'FOD_CLIENT_SECRET', 'FOD_APPLICATION_ID', 'FCLI_VERSION')
-$Missing = @()
-foreach ($var in $RequiredVars) {
-    if (-not $EnvVars[$var]) { $Missing += $var }
-}
-if ($Missing.Count -gt 0) {
-    Write-LogError "Variaveis obrigatorias nao definidas no .env: $($Missing -join ', ')"
-    exit 1
-}
-
-if ($FOD_INSECURE) {
-    Write-LogWarn "FOD_INSECURE=true: validacao de certificado SSL desabilitada (bypass Netskope)."
-    [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
-}
+Import-FodEnv -EnvFile $EnvFile
 
 # ============================================================================
 # INSTALAR / LOCALIZAR fcli
 # ============================================================================
 
-Write-LogStep "Preparando fcli"
-
-New-Item -ItemType Directory -Path $ToolsDir -Force | Out-Null
-
-$Fcli = $null
-$FcliExeName = if ((Test-Path variable:IsLinux) -and $IsLinux -or (Test-Path variable:IsMacOS) -and $IsMacOS) { 'fcli' } else { 'fcli.exe' }
-
-$FcliInPath = Get-Command $FcliExeName -ErrorAction SilentlyContinue
-if ($FcliInPath) {
-    $Fcli = $FcliInPath.Source
-    Write-LogInfo "fcli encontrado no PATH: $Fcli"
-}
-
-if (-not $Fcli) {
-    $FcliLocal = Join-Path $ToolsDir $FcliExeName
-    if (Test-Path $FcliLocal) {
-        $Fcli = $FcliLocal
-        Write-LogInfo "fcli encontrado em: $Fcli"
-    }
-}
-
-if (-not $Fcli) {
-    Write-LogInfo "fcli nao encontrado. Baixando versao $FCLI_VERSION..."
-
-    $FcliBaseUrl = "https://github.com/fortify/fcli/releases/download/$FCLI_VERSION"
-    $FcliArchive = if ((Test-Path variable:IsLinux) -and $IsLinux) { 'fcli-linux.tgz' } elseif ((Test-Path variable:IsMacOS) -and $IsMacOS) { 'fcli-mac.tgz' } else { 'fcli-windows.zip' }
-    $FcliArchivePath = Join-Path $ToolsDir $FcliArchive
-
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    Invoke-WebRequest -Uri "$FcliBaseUrl/$FcliArchive" -OutFile $FcliArchivePath -UseBasicParsing
-
-    if ($FcliArchive -match '\.zip$') {
-        Expand-Archive -Path $FcliArchivePath -DestinationPath $ToolsDir -Force
-    } else {
-        tar -xzf $FcliArchivePath -C $ToolsDir
-    }
-
-    $Fcli = Join-Path $ToolsDir $FcliExeName
-    if (-not (Test-Path $Fcli)) {
-        Write-LogError "Falha ao extrair fcli para: $Fcli"
-        exit 1
-    }
-    Write-LogInfo "fcli instalado em: $Fcli"
-}
-
-& $Fcli -V
+$Fcli = Get-FcliPath -ToolsDir $ToolsDir -FcliVersion $FCLI_VERSION
 
 # ============================================================================
 # LOGIN NO FORTIFY ON DEMAND
 # ============================================================================
 
-Write-LogStep "Conectando ao Fortify on Demand"
-
-& $Fcli fod session login `
-    --url $FOD_URL `
-    --client-id $FOD_CLIENT_ID `
-    --client-secret $FOD_CLIENT_SECRET
-
-if ($LASTEXITCODE -ne 0) {
-    Write-LogError "Falha ao conectar com Fortify on Demand"
-    exit 1
-}
-
-Write-LogInfo "Conectado ao FoD com sucesso"
+Connect-FodSession -Fcli $Fcli -FodUrl $FOD_URL -ClientId $FOD_CLIENT_ID -ClientSecret $FOD_CLIENT_SECRET
 
 # ============================================================================
 # RESOLVER USERID NUMERICO
@@ -174,7 +69,7 @@ $AssignUserId = (& $Fcli fod rest call "/api/v3/users?filters=userName:$AssignUs
 
 if (-not $AssignUserId) {
     Write-LogError "Usuario '$AssignUser' nao encontrado no FoD"
-    & $Fcli fod session logout 2>$null
+    Disconnect-FodSession -Fcli $Fcli
     exit 1
 }
 
@@ -184,14 +79,14 @@ Write-LogInfo "UserId resolvido: $AssignUserId"
 # LISTAR RELEASES DA APPLICATION
 # ============================================================================
 
-Write-LogStep "Listando releases da Application $FOD_APPLICATION_ID"
+Write-LogStep "Listando releases da Application $FOD_APPLICATION_NAME"
 
-$releases = & $Fcli fod release list --app $FOD_APPLICATION_ID -o json |
+$releases = & $Fcli fod release list --app $FOD_APPLICATION_NAME -o json |
     Out-String | ConvertFrom-Json
 
 if (-not $releases -or $releases.Count -eq 0) {
-    Write-LogWarn "Nenhuma release encontrada para Application $FOD_APPLICATION_ID"
-    & $Fcli fod session logout 2>$null
+    Write-LogWarn "Nenhuma release encontrada para Application $FOD_APPLICATION_NAME"
+    Disconnect-FodSession -Fcli $Fcli
     exit 0
 }
 
@@ -283,7 +178,7 @@ foreach ($release in $releases) {
 
 Write-LogStep "Resumo da execucao"
 
-Write-LogInfo "Application ID  : $FOD_APPLICATION_ID"
+Write-LogInfo "Application     : $FOD_APPLICATION_NAME"
 Write-LogInfo "Usuario atribuido: $AssignUser"
 Write-LogInfo "Releases processadas: $totalReleases / $($releases.Count) ($totalReleasesComVulns com vulnerabilidades)"
 Write-LogInfo "Vulnerabilidades atribuidas: $totalAtribuidas / $totalVulns"
@@ -295,5 +190,4 @@ Write-LogInfo "Execucao finalizada com sucesso"
 # LOGOUT
 # ============================================================================
 
-Write-LogInfo "Encerrando sessao FoD..."
-& $Fcli fod session logout 2>$null
+Disconnect-FodSession -Fcli $Fcli

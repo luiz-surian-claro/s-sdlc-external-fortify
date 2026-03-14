@@ -41,74 +41,14 @@ $EnvFile   = Join-Path $ScriptDir '.env'
 $ToolsDir  = Join-Path $ScriptDir '.tools'
 $WorkDir   = Join-Path $ScriptDir '.work'
 
-# ============================================================================
-# FUNÇÕES AUXILIARES
-# ============================================================================
-
-function Write-LogInfo  { param([string]$Message) Write-Host "[INFO]  $Message" }
-function Write-LogWarn  { param([string]$Message) Write-Host "[WARN]  $Message" -ForegroundColor Yellow }
-function Write-LogError { param([string]$Message) Write-Host "[ERROR] $Message" -ForegroundColor Red }
-function Write-LogStep  { param([string]$Message)
-    Write-Host ""
-    Write-Host ("=" * 64)
-    Write-Host "  $Message"
-    Write-Host ("=" * 64)
-}
-
-function Invoke-Cleanup {
-    Write-LogInfo "Encerrando sessao FoD..."
-    & $Fcli fod session logout 2>$null
-}
+. (Join-Path $ScriptDir 'fortify-common.ps1')
 
 # ============================================================================
 # CARREGAR .env
 # ============================================================================
 
-if (-not (Test-Path $EnvFile)) {
-    Write-LogError "Arquivo .env nao encontrado em: $EnvFile"
-    Write-LogError "Crie o arquivo .env com as variaveis FOD_URL, FOD_CLIENT_ID, FOD_CLIENT_SECRET, GITLAB_URL, GITLAB_TOKEN, FOD_APPLICATION_ID, FCLI_VERSION"
-    exit 1
-}
-
-$EnvVars = @{}
-Get-Content $EnvFile | ForEach-Object {
-    $line = $_.Trim()
-    if ($line -and -not $line.StartsWith('#')) {
-        $parts = $line -split '=', 2
-        if ($parts.Count -eq 2) {
-            $EnvVars[$parts[0].Trim()] = $parts[1].Trim()
-        }
-    }
-}
-
-# Exportar como variáveis do script
-$FOD_URL            = $EnvVars['FOD_URL']
-$FOD_CLIENT_ID      = $EnvVars['FOD_CLIENT_ID']
-$FOD_CLIENT_SECRET  = $EnvVars['FOD_CLIENT_SECRET']
-$FOD_APPLICATION_ID = $EnvVars['FOD_APPLICATION_ID']
-$GITLAB_TOKEN       = $EnvVars['GITLAB_TOKEN']
-$GITLAB_URL         = $EnvVars['GITLAB_URL']
-$FCLI_VERSION       = $EnvVars['FCLI_VERSION']
-$FOD_INSECURE       = ($EnvVars['FOD_INSECURE'] -eq 'true')
-
-# Validar variáveis obrigatórias
-$RequiredVars = @('FOD_URL', 'FOD_CLIENT_ID', 'FOD_CLIENT_SECRET', 'FOD_APPLICATION_ID', 'GITLAB_TOKEN', 'FCLI_VERSION')
-$Missing = @()
-foreach ($var in $RequiredVars) {
-    if (-not $EnvVars[$var]) {
-        $Missing += $var
-    }
-}
-if ($Missing.Count -gt 0) {
-    Write-LogError "Variaveis obrigatorias nao definidas no .env: $($Missing -join ', ')"
-    exit 1
-}
-
-if ($FOD_INSECURE) {
-    Write-LogWarn "FOD_INSECURE=true: validacao de certificado SSL desabilitada (bypass Netskope)."
-    # Necessario para Invoke-WebRequest em PS 5.1 (nao suporta -SkipCertificateCheck)
-    [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
-}
+Import-FodEnv -EnvFile $EnvFile `
+    -RequiredVars @('FOD_URL', 'FOD_CLIENT_ID', 'FOD_CLIENT_SECRET', 'FOD_APPLICATION_NAME', 'FOD_APP_TYPE', 'FOD_APP_CRITICALITY', 'GITLAB_TOKEN', 'FCLI_VERSION')
 
 # ============================================================================
 # MONTAR LISTA DE REPOSITÓRIOS
@@ -116,14 +56,29 @@ if ($FOD_INSECURE) {
 
 $RepoList = [System.Collections.Generic.List[string]]::new()
 
+function Resolve-RepoUrl {
+    param([string]$Entry)
+    if ($Entry -match '^https?://') {
+        return $Entry
+    }
+    # Bare repo name/path: use GITLAB_URL as base
+    if (-not $GITLAB_URL) {
+        Write-LogError "Entrada '$Entry' nao e uma URL completa e GITLAB_URL nao esta definido no .env"
+        exit 1
+    }
+    $base = $GITLAB_URL.TrimEnd('/')
+    $path = $Entry.TrimStart('/')
+    return "$base/$path"
+}
+
 foreach ($arg in $Repos) {
     if (Test-Path $arg -PathType Leaf) {
         Get-Content $arg | ForEach-Object {
             $line = ($_ -replace '#.*', '').Trim()
-            if ($line) { $RepoList.Add($line) }
+            if ($line) { $RepoList.Add((Resolve-RepoUrl $line)) }
         }
     } else {
-        $RepoList.Add($arg)
+        $RepoList.Add((Resolve-RepoUrl $arg))
     }
 }
 
@@ -141,96 +96,14 @@ foreach ($r in $RepoList) {
 # INSTALAR / LOCALIZAR fcli
 # ============================================================================
 
-Write-LogStep "Preparando fcli"
-
-New-Item -ItemType Directory -Path $ToolsDir -Force | Out-Null
 New-Item -ItemType Directory -Path $WorkDir -Force | Out-Null
-
-$Fcli = $null
-$FcliExeName = if ($IsLinux -or $IsMacOS) { 'fcli' } else { 'fcli.exe' }
-
-# Verificar no PATH
-$FcliInPath = Get-Command $FcliExeName -ErrorAction SilentlyContinue
-if ($FcliInPath) {
-    $Fcli = $FcliInPath.Source
-    Write-LogInfo "fcli encontrado no PATH: $Fcli"
-}
-
-# Verificar no diretório de ferramentas
-if (-not $Fcli) {
-    $FcliLocal = Join-Path $ToolsDir $FcliExeName
-    if (Test-Path $FcliLocal) {
-        $Fcli = $FcliLocal
-        Write-LogInfo "fcli encontrado em: $Fcli"
-    }
-}
-
-# Baixar se não encontrado
-if (-not $Fcli) {
-    Write-LogInfo "fcli nao encontrado. Baixando versao $FCLI_VERSION..."
-
-    $FcliBaseUrl = "https://github.com/fortify/fcli/releases/download/$FCLI_VERSION"
-
-    if ($IsLinux) {
-        $FcliArchive = 'fcli-linux.tgz'
-    } elseif ($IsMacOS) {
-        $FcliArchive = 'fcli-mac.tgz'
-    } else {
-        $FcliArchive = 'fcli-windows.zip'
-    }
-
-    $FcliDownloadUrl = "$FcliBaseUrl/$FcliArchive"
-    $FcliArchivePath = Join-Path $ToolsDir $FcliArchive
-
-    Write-LogInfo "Baixando de: $FcliDownloadUrl"
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    Invoke-WebRequest -Uri $FcliDownloadUrl -OutFile $FcliArchivePath -UseBasicParsing
-
-    if ($FcliArchive -match '\.zip$') {
-        Expand-Archive -Path $FcliArchivePath -DestinationPath $ToolsDir -Force
-    } else {
-        # Para .tgz no PowerShell, usar tar (disponível no Windows 10+)
-        tar -xzf $FcliArchivePath -C $ToolsDir
-    }
-
-    $Fcli = Join-Path $ToolsDir $FcliExeName
-
-    if (-not (Test-Path $Fcli)) {
-        Write-LogError "Falha ao extrair fcli para: $Fcli"
-        exit 1
-    }
-
-    Write-LogInfo "fcli instalado em: $Fcli"
-}
-
-& $Fcli -V
+$Fcli = Get-FcliPath -ToolsDir $ToolsDir -FcliVersion $FCLI_VERSION
 
 # ============================================================================
 # LOGIN NO FORTIFY ON DEMAND
 # ============================================================================
 
-Write-LogStep "Conectando ao Fortify on Demand"
-
-$LoginArgs = @(
-    'fod', 'session', 'login',
-    '--url', $FOD_URL,
-    '--client-id', $FOD_CLIENT_ID,
-    '--client-secret', $FOD_CLIENT_SECRET
-)
-
-& $Fcli @LoginArgs
-
-if ($LASTEXITCODE -ne 0) {
-    Write-LogError "Falha ao conectar com Fortify on Demand"
-    exit 1
-}
-
-Write-LogInfo "Conectado ao FoD com sucesso"
-
-# Registrar cleanup para execução no final
-$null = Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action {
-    & $Fcli fod session logout 2>$null
-}
+Connect-FodSession -Fcli $Fcli -FodUrl $FOD_URL -ClientId $FOD_CLIENT_ID -ClientSecret $FOD_CLIENT_SECRET
 
 # ============================================================================
 # FUNÇÕES DE PROCESSAMENTO
@@ -238,20 +111,23 @@ $null = Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action {
 
 function Get-RepoName {
     param([string]$Url)
-    $name = [System.IO.Path]::GetFileNameWithoutExtension($Url)
-    if ($name.EndsWith('.git')) {
-        $name = $name.Substring(0, $name.Length - 4)
-    }
+    $repoUri = [Uri]$Url
+    # Split path into non-empty segments
+    $segments = $repoUri.AbsolutePath.TrimStart('/').Split('/') | Where-Object { $_ }
+    # Skip the first segment (e.g. 'Claro-Brasil') and join the rest with '_'
+    $name = ($segments | Select-Object -Skip 1) -join '_'
+    # Remove .git suffix
+    $name = $name -replace '\.git$', ''
     return $name
 }
 
 function Get-OrCreateRelease {
     param([string]$ReleaseName)
 
-    Write-LogInfo "Verificando release '$ReleaseName' na application $FOD_APPLICATION_ID..."
+    Write-LogInfo "Verificando release '$ReleaseName' na application $FOD_APPLICATION_NAME..."
 
     # Verificar se ja existe
-    $releaseId = (& $Fcli fod release list --app $FOD_APPLICATION_ID `
+    $releaseId = (& $Fcli fod release list --app $FOD_APPLICATION_NAME `
         -q "releaseName=='$ReleaseName'" `
         -o "expr={releaseId}" 2>&1 | Select-Object -First 1).ToString().Trim()
 
@@ -262,8 +138,10 @@ function Get-OrCreateRelease {
 
     Write-LogInfo "Release nao encontrado. Criando release '$ReleaseName'..."
 
-    & $Fcli fod release create "${FOD_APPLICATION_ID}:${ReleaseName}" `
+    & $Fcli fod release create "${FOD_APPLICATION_NAME}:${ReleaseName}" `
         --sdlc-status Development `
+        --app-type $FOD_APP_TYPE `
+        --app-criticality $FOD_APP_CRITICALITY `
         --store new_release | Out-Host
 
     if ($LASTEXITCODE -ne 0) {
@@ -344,7 +222,8 @@ foreach ($RepoUrl in $RepoList) {
         --assessment-type "Static Assessment" `
         --frequency Subscription `
         --audit-preference Automated `
-        --oss | Out-Host
+        --oss `
+        --use-aviator | Out-Host
 
     if ($LASTEXITCODE -ne 0) {
         Write-LogError "Falha ao configurar SAST+SCA para $RepoName"
@@ -380,7 +259,7 @@ foreach ($RepoUrl in $RepoList) {
 Write-LogStep "Resumo da execucao"
 
 Write-LogInfo "Repositorios processados: $($RepoList.Count)"
-Write-LogInfo "Application ID: $FOD_APPLICATION_ID (CNPJ-ALPHA)"
+Write-LogInfo "Application: $FOD_APPLICATION_NAME"
 Write-LogInfo "ZIPs gerados em: $WorkDir"
 Write-LogInfo "Para acompanhar os scans, acesse: $FOD_URL"
 
@@ -388,4 +267,4 @@ Write-Host ""
 Write-LogInfo "Execucao finalizada com sucesso"
 
 # Cleanup
-Invoke-Cleanup
+Disconnect-FodSession -Fcli $Fcli
