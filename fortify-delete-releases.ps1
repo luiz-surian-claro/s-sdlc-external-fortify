@@ -32,8 +32,10 @@ $ErrorActionPreference = 'Stop'
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $EnvFile   = Join-Path $ScriptDir '.env'
 $ToolsDir  = Join-Path $ScriptDir '.tools'
+$LogsDir   = Join-Path $ScriptDir 'logs'
 
 . (Join-Path $ScriptDir 'fortify-common.ps1')
+Initialize-LogFile -LogsDir $LogsDir -ScriptName 'fortify-delete-releases'
 
 # ============================================================================
 # CARREGAR .env

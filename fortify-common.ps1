@@ -14,14 +14,53 @@
 # FUNÇÕES DE LOG
 # ============================================================================
 
-function Write-LogInfo  { param([string]$Message) Write-Host "[INFO]  $Message" }
-function Write-LogWarn  { param([string]$Message) Write-Host "[WARN]  $Message" -ForegroundColor Yellow }
-function Write-LogError { param([string]$Message) Write-Host "[ERROR] $Message" -ForegroundColor Red }
-function Write-LogStep  { param([string]$Message)
+$script:LogFile = $null
+
+function Initialize-LogFile {
+    param(
+        [Parameter(Mandatory)] [string]$LogsDir,
+        [Parameter(Mandatory)] [string]$ScriptName
+    )
+    New-Item -ItemType Directory -Path $LogsDir -Force | Out-Null
+    $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $script:LogFile = Join-Path $LogsDir "${ScriptName}_${timestamp}.log"
+    Write-LogInfo "Log gravado em: $($script:LogFile)"
+}
+
+function Write-LogLine {
+    param([string]$Line)
+    if ($script:LogFile) { Add-Content -Path $script:LogFile -Value $Line -Encoding UTF8 }
+}
+
+function Write-LogInfo  {
+    param([string]$Message)
+    $line = "[INFO]  $Message"
+    Write-Host $line
+    Write-LogLine $line
+}
+function Write-LogWarn  {
+    param([string]$Message)
+    $line = "[WARN]  $Message"
+    Write-Host $line -ForegroundColor Yellow
+    Write-LogLine $line
+}
+function Write-LogError {
+    param([string]$Message)
+    $line = "[ERROR] $Message"
+    Write-Host $line -ForegroundColor Red
+    Write-LogLine $line
+}
+function Write-LogStep  {
+    param([string]$Message)
+    $sep = '=' * 64
     Write-Host ""
-    Write-Host ("=" * 64)
+    Write-Host $sep
     Write-Host "  $Message"
-    Write-Host ("=" * 64)
+    Write-Host $sep
+    Write-LogLine ""
+    Write-LogLine $sep
+    Write-LogLine "  $Message"
+    Write-LogLine $sep
 }
 
 # ============================================================================

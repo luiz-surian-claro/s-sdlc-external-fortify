@@ -6,6 +6,7 @@
 .work/
 
 # Arquivos de log
+logs/*
 *.log
 
 # Lista de repositorios

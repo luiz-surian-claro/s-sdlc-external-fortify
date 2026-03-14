@@ -164,6 +164,7 @@ fortify-delete-releases.ps1 # Script de exclusão de releases
 repos/                      # Arquivos de listas de repositórios
 .tools/                     # fcli baixado automaticamente (ignorado pelo git)
 .work/                      # ZIPs dos repositórios gerados durante a execução (ignorado pelo git)
+logs/                       # Arquivos de log gerados por cada execução (ignorado pelo git)
 .env                        # Variáveis de configuração (ignorado pelo git)
 ```
 
