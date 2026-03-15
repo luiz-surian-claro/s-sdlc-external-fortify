@@ -143,7 +143,6 @@ $appRows = [System.Collections.Generic.List[object]]::new()
 
 $appIndex = 0
 foreach ($app in $allApps) {
-    $appId   = $app.applicationId
     $appName = $app.applicationName
     $appIndex++
 

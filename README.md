@@ -8,10 +8,9 @@ Scripts de automação para submeter scans **SAST** (Static Application Security
 
 | Script | Descrição |
 | --- | --- |
-| `fortify-scan.ps1` | Baixa repositórios GitLab, cria releases e submete scans SAST+SCA ao FoD |
+| `fortify-scan.ps1` | Baixa repositórios GitLab, cria Applications individuais e submete scans SAST+SCA ao FoD |
 | `fortify-assign.ps1` | Atribui todas as vulnerabilidades de todas as releases a um usuário FoD |
-| `fortify-delete-releases.ps1` | Exclui todas as releases da Application no FoD |
-| `fortify-stats.ps1` | Exibe estatísticas da Application: total de releases e contagem de scans por status |
+| `fortify-stats.ps1` | Exibe estatísticas de todas as Applications do grupo: total de releases e contagem de scans por status |
 | `fortify-common.ps1` | Helper interno com funções compartilhadas (não executar diretamente) |
 
 ---
@@ -25,7 +24,7 @@ Para cada repositório informado, o script executa os seguintes passos:
 1. **Localiza ou baixa o `fcli`** — verifica no `PATH` e em `.tools/`; se não encontrado, faz o download da versão definida em `FCLI_VERSION`.
 2. **Autentica no FoD** via Client Credentials (`FOD_CLIENT_ID` / `FOD_CLIENT_SECRET`).
 3. **Baixa o código-fonte** diretamente da API do GitLab como arquivo `.zip` (branch padrão).
-4. **Cria ou reutiliza um Release** no FoD dentro da Application definida por `FOD_APPLICATION_NAME`. Se a Application não existir, ela é criada automaticamente com `FOD_APP_TYPE` e `FOD_APP_CRITICALITY`.
+4. **Cria ou reutiliza uma Application standalone** por repositório, cujo nome é derivado do caminho GitLab (`grupo_repositorio`). A Application é criada com `FOD_APP_TYPE` e `FOD_APP_CRITICALITY` e registrada automaticamente no user group `FOD_APP_GROUP`. O Release é nomeado pela branch padrão do repositório (`main` ou `master`).
 5. **Configura e inicia o scan SAST+SCA** (`fcli fod sast-scan setup` + `start`).
 
 Ao final, a sessão FoD é encerrada automaticamente.
@@ -33,12 +32,6 @@ Ao final, a sessão FoD é encerrada automaticamente.
 ### `fortify-assign.ps1`
 
 Para cada release da Application, lista todas as vulnerabilidades e realiza um bulk update via REST API para atribuí-las ao usuário informado.
-
-### `fortify-delete-releases.ps1`
-
-Lista todas as releases da Application e as exclui permanentemente. Solicita confirmação interativa antes de prosseguir (use `-Force` para pular).
-
-> **Atenção:** a exclusão de todas as releases também remove a Application do FoD. Ao recriar releases com `fortify-scan.ps1`, a Application será recriada automaticamente.
 
 ---
 
@@ -64,12 +57,11 @@ FOD_CLIENT_ID=<seu-client-id>
 FOD_CLIENT_SECRET=<seu-client-secret>
 
 # Fortify on Demand - Application
-FOD_APPLICATION_NAME=<nome-da-application-no-fod>
+FOD_APP_GROUP=<nome-do-user-group-no-fod>
 FOD_APP_TYPE=Web
 FOD_APP_CRITICALITY=High
-
-# SDLC Status das releases criadas
 FOD_SDLC_STATUS=Production
+FOD_ASSIGN_USER=
 
 # GitLab
 GITLAB_URL=https://gitlab.exemplo.com.br
@@ -77,9 +69,6 @@ GITLAB_TOKEN=<seu-token-privado-gitlab>
 
 # Versão do fcli a baixar caso não esteja instalado
 FCLI_VERSION=v3.15.0
-
-# Usuário padrão para atribuição de vulnerabilidades (fortify-assign.ps1)
-FOD_ASSIGN_USER=
 
 # Opcional: desabilita validação de certificado SSL (ex.: bypass Netskope)
 # FOD_INSECURE=true
@@ -90,9 +79,9 @@ FOD_ASSIGN_USER=
 | `FOD_URL` | Sim | URL base do Fortify on Demand |
 | `FOD_CLIENT_ID` | Sim | Client ID da conta de serviço FoD |
 | `FOD_CLIENT_SECRET` | Sim | Client Secret da conta de serviço FoD |
-| `FOD_APPLICATION_NAME` | Sim | Nome da Application no FoD onde os releases serão criados |
-| `FOD_APP_TYPE` | Sim | Tipo da Application ao criar (valores: `Web`, `ThickClient`, `Mobile`, `Microservice`) |
-| `FOD_APP_CRITICALITY` | Sim | Criticidade de negócio ao criar a Application (valores: `High`, `Medium`, `Low`) |
+| `FOD_APP_GROUP` | Sim | Nome do user group no FoD sob o qual todas as Applications são registradas |
+| `FOD_APP_TYPE` | Sim | Tipo das Applications criadas (valores: `Web`, `ThickClient`, `Mobile`, `Microservice`) |
+| `FOD_APP_CRITICALITY` | Sim | Criticidade de negócio das Applications criadas (valores: `High`, `Medium`, `Low`) |
 | `FOD_SDLC_STATUS` | Sim | Status SDLC das releases criadas (valores: `Development`, `QA`, `Production`, `Retired`) |
 | `GITLAB_TOKEN` | Sim | Personal/Project Access Token do GitLab |
 | `GITLAB_URL` | Não | URL base do GitLab (usado para resolver URLs relativas) |
@@ -149,16 +138,6 @@ https://gitlab.exemplo.com.br/grupo/repo-c.git
 .\fortify-stats.ps1
 ```
 
-### Uso: `fortify-delete-releases.ps1`
-
-```powershell
-# Com confirmação interativa
-.\fortify-delete-releases.ps1
-
-# Sem confirmação (ex.: pipelines CI/CD)
-.\fortify-delete-releases.ps1 -Force
-```
-
 ---
 
 ## Estrutura de diretórios
@@ -167,9 +146,9 @@ https://gitlab.exemplo.com.br/grupo/repo-c.git
 fortify-common.ps1          # Helper compartilhado (dot-sourced pelos outros scripts)
 fortify-scan.ps1            # Script principal de scan
 fortify-assign.ps1          # Script de atribuição de vulnerabilidades
-fortify-delete-releases.ps1 # Script de exclusão de releases
-fortify-stats.ps1           # Script de estatísticas da Application
+fortify-stats.ps1           # Script de estatísticas por Application
 repos/                      # Arquivos de listas de repositórios
+reference/                  # Scripts legados (mantidos apenas para referência, não utilizados)
 .tools/                     # fcli baixado automaticamente (ignorado pelo git)
 .work/                      # ZIPs dos repositórios gerados durante a execução (ignorado pelo git)
 logs/                       # Arquivos de log gerados por cada execução (ignorado pelo git)
