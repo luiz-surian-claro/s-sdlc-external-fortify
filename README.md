@@ -11,6 +11,7 @@ Scripts de automação para submeter scans **SAST** (Static Application Security
 | `fortify-scan.ps1` | Baixa repositórios GitLab, cria releases e submete scans SAST+SCA ao FoD |
 | `fortify-assign.ps1` | Atribui todas as vulnerabilidades de todas as releases a um usuário FoD |
 | `fortify-delete-releases.ps1` | Exclui todas as releases da Application no FoD |
+| `fortify-stats.ps1` | Exibe estatísticas da Application: total de releases e contagem de scans por status |
 | `fortify-common.ps1` | Helper interno com funções compartilhadas (não executar diretamente) |
 
 ---
@@ -142,6 +143,12 @@ https://gitlab.exemplo.com.br/grupo/repo-c.git
 .\fortify-assign.ps1 -AssignUser outro.usuario
 ```
 
+### Uso: `fortify-stats.ps1`
+
+```powershell
+.\fortify-stats.ps1
+```
+
 ### Uso: `fortify-delete-releases.ps1`
 
 ```powershell
@@ -161,6 +168,7 @@ fortify-common.ps1          # Helper compartilhado (dot-sourced pelos outros scr
 fortify-scan.ps1            # Script principal de scan
 fortify-assign.ps1          # Script de atribuição de vulnerabilidades
 fortify-delete-releases.ps1 # Script de exclusão de releases
+fortify-stats.ps1           # Script de estatísticas da Application
 repos/                      # Arquivos de listas de repositórios
 .tools/                     # fcli baixado automaticamente (ignorado pelo git)
 .work/                      # ZIPs dos repositórios gerados durante a execução (ignorado pelo git)
