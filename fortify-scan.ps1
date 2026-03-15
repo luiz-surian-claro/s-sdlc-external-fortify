@@ -198,6 +198,12 @@ foreach ($RepoUrl in $RepoList) {
         continue
     }
 
+    $ZipFile = ConvertTo-ValidZip -FilePath $ZipFile -WorkDir $WorkDir
+    if (-not $ZipFile) {
+        Write-LogError "Arquivo invalido ou falha na conversao para '$RepoName'. Pulando..."
+        continue
+    }
+
     $ZipSize   = (Get-Item $ZipFile).Length
     $ZipSizeMB = [math]::Round($ZipSize / 1MB, 2)
     Write-LogInfo "Pacote gerado: $ZipFile (${ZipSizeMB} MB)"

@@ -128,6 +128,76 @@ function Import-FodEnv {
 }
 
 # ============================================================================
+# VALIDAR / CONVERTER ARQUIVO ZIP
+# ============================================================================
+
+function ConvertTo-ValidZip {
+    <#
+    .SYNOPSIS
+        Garante que o arquivo seja um ZIP válido para o Fortify on Demand.
+        Se o servidor retornar gzip/tar.gz, extrai e reempacota como ZIP.
+    .PARAMETER FilePath
+        Caminho do arquivo baixado.
+    .PARAMETER WorkDir
+        Diretório de trabalho para arquivos temporários.
+    #>
+    param(
+        [Parameter(Mandatory)] [string]$FilePath,
+        [Parameter(Mandatory)] [string]$WorkDir
+    )
+
+    # Ler os primeiros 4 bytes para detectar o formato
+    $header = New-Object byte[] 4
+    $stream = [System.IO.File]::OpenRead($FilePath)
+    $stream.Read($header, 0, 4) | Out-Null
+    $stream.Close()
+
+    # ZIP magic: PK (0x50 0x4B)
+    if ($header[0] -eq 0x50 -and $header[1] -eq 0x4B) {
+        return $FilePath
+    }
+
+    # GZIP magic: 0x1F 0x8B
+    if ($header[0] -eq 0x1F -and $header[1] -eq 0x8B) {
+        Write-LogWarn "Arquivo baixado em formato gzip, convertendo para zip..."
+
+        $baseName   = [System.IO.Path]::GetFileNameWithoutExtension($FilePath)
+        $tarGzPath  = Join-Path $WorkDir "$baseName.tar.gz"
+        $extractDir = Join-Path $WorkDir "${baseName}_src"
+
+        Move-Item -Path $FilePath -Destination $tarGzPath
+        New-Item -ItemType Directory -Path $extractDir -Force | Out-Null
+
+        tar -xzf $tarGzPath -C $extractDir
+        if ($LASTEXITCODE -ne 0) {
+            Write-LogError "Falha ao extrair $tarGzPath"
+            return $null
+        }
+
+        Push-Location $extractDir
+        try {
+            Compress-Archive -Path * -DestinationPath $FilePath -Force
+        } finally {
+            Pop-Location
+        }
+
+        if (-not (Test-Path $FilePath)) {
+            Write-LogError "Falha ao criar ZIP a partir do conteudo extraido"
+            return $null
+        }
+
+        Remove-Item -Recurse -Force $extractDir
+        Remove-Item -Force $tarGzPath
+
+        Write-LogInfo "Arquivo convertido para ZIP: $FilePath"
+        return $FilePath
+    }
+
+    Write-LogError "Formato de arquivo desconhecido (nao e ZIP nem GZIP): $FilePath"
+    return $null
+}
+
+# ============================================================================
 # INSTALAR / LOCALIZAR fcli
 # ============================================================================
 
