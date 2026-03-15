@@ -175,9 +175,7 @@ function Get-OrCreateApplication {
 
     Write-LogInfo "Verificando application '$AppName' (grupo: $FOD_APP_GROUP)..."
 
-    $appId = (& $Fcli fod app list `
-        -q "applicationName=='$AppName'" `
-        -o "expr={applicationId}" 2>&1 | Select-Object -First 1).ToString().Trim()
+    $appId = (Invoke-FcliCommand @('fod','app','list','-q',"applicationName=='$AppName'",'-o','expr={applicationId}') -Silent | Select-Object -First 1).ToString().Trim()
 
     if ($appId -match '^\d+$') {
         Write-LogInfo "Application existente encontrada: ID=$appId"
@@ -186,20 +184,14 @@ function Get-OrCreateApplication {
 
     Write-LogInfo "Application nao encontrada. Criando '$AppName' com release '$BranchName'..."
 
-    & $Fcli fod app create $AppName `
-        --release $BranchName `
-        --type $FOD_APP_TYPE `
-        --criticality $FOD_APP_CRITICALITY `
-        --status $FOD_SDLC_STATUS `
-        --store new_app | Out-Host
+    Invoke-FcliCommand @('fod','app','create',$AppName,'--release',$BranchName,'--type',$FOD_APP_TYPE,'--criticality',$FOD_APP_CRITICALITY,'--status',$FOD_SDLC_STATUS,'--store','new_app')
 
     if ($LASTEXITCODE -ne 0) {
         Write-LogError "Falha ao criar application '$AppName'"
         return $null
     }
 
-    $appId = (& $Fcli fod app get "::new_app::" `
-        -o "expr={applicationId}" 2>&1 | Select-Object -First 1).ToString().Trim()
+    $appId = (Invoke-FcliCommand @('fod','app','get','::new_app::','-o','expr={applicationId}') -Silent | Select-Object -First 1).ToString().Trim()
 
     if (-not ($appId -match '^\d+$')) {
         Write-LogError "Falha ao obter ID da application '$AppName'"
@@ -232,9 +224,7 @@ function Get-OrCreateRelease {
 
     Write-LogInfo "Verificando release '$ReleaseName' na application '$AppName'..."
 
-    $releaseId = (& $Fcli fod release list --app $AppName `
-        -q "releaseName=='$ReleaseName'" `
-        -o "expr={releaseId}" 2>&1 | Select-Object -First 1).ToString().Trim()
+    $releaseId = (Invoke-FcliCommand @('fod','release','list','--app',$AppName,'-q',"releaseName=='$ReleaseName'",'-o','expr={releaseId}') -Silent | Select-Object -First 1).ToString().Trim()
 
     if ($releaseId -match '^\d+$') {
         Write-LogInfo "Release existente encontrado: ID=$releaseId"
@@ -243,19 +233,14 @@ function Get-OrCreateRelease {
 
     Write-LogInfo "Release nao encontrado. Criando release '$ReleaseName'..."
 
-    & $Fcli fod release create "${AppName}:${ReleaseName}" `
-        --sdlc-status $FOD_SDLC_STATUS `
-        --app-type $FOD_APP_TYPE `
-        --app-criticality $FOD_APP_CRITICALITY `
-        --store new_release | Out-Host
+    Invoke-FcliCommand @('fod','release','create',"${AppName}:${ReleaseName}",'--sdlc-status',$FOD_SDLC_STATUS,'--app-type',$FOD_APP_TYPE,'--app-criticality',$FOD_APP_CRITICALITY,'--store','new_release')
 
     if ($LASTEXITCODE -ne 0) {
         Write-LogError "Falha ao criar release '$ReleaseName'"
         return $null
     }
 
-    $releaseId = (& $Fcli fod release get "::new_release::" `
-        -o "expr={releaseId}" 2>&1 | Select-Object -First 1).ToString().Trim()
+    $releaseId = (Invoke-FcliCommand @('fod','release','get','::new_release::','-o','expr={releaseId}') -Silent | Select-Object -First 1).ToString().Trim()
 
     if ($releaseId -match '^\d+$') {
         Write-LogInfo "Release criado: ID=$releaseId"
@@ -287,9 +272,7 @@ foreach ($RepoUrl in $RepoList) {
     # 2. Verificar se a Application já existe (antes de baixar o ZIP)
     # ========================================================================
 
-    $existingAppId = (& $Fcli fod app list `
-        -q "applicationName=='$RepoName'" `
-        -o "expr={applicationId}" 2>&1 | Select-Object -First 1).ToString().Trim()
+    $existingAppId = (Invoke-FcliCommand @('fod','app','list','-q',"applicationName=='$RepoName'",'-o','expr={applicationId}') -Silent | Select-Object -First 1).ToString().Trim()
 
     if ($existingAppId -match '^\d+$') {
         if (-not $Force) {
@@ -362,13 +345,7 @@ foreach ($RepoUrl in $RepoList) {
 
     Write-LogInfo "Configurando SAST+SCA para release $ReleaseId..."
 
-    & $Fcli fod sast-scan setup `
-        --rel $ReleaseId `
-        --assessment-type "Static Assessment" `
-        --frequency Subscription `
-        --audit-preference Automated `
-        --oss `
-        --use-aviator | Out-Host
+    Invoke-FcliCommand @('fod','sast-scan','setup','--rel',$ReleaseId,'--assessment-type','Static Assessment','--frequency','Subscription','--audit-preference','Automated','--oss','--use-aviator')
 
     if ($LASTEXITCODE -ne 0) {
         Write-LogError "Falha ao configurar SAST+SCA para $RepoName"
@@ -381,10 +358,7 @@ foreach ($RepoUrl in $RepoList) {
 
     Write-LogInfo "Iniciando scans SAST e SCA no release $ReleaseId..."
 
-    & $Fcli fod sast-scan start `
-        --rel $ReleaseId `
-        -f $ZipFile `
-        --store "sast_scan_$RepoVarName" | Out-Host
+    Invoke-FcliCommand @('fod','sast-scan','start','--rel',$ReleaseId,'-f',$ZipFile,'--store',"sast_scan_$RepoVarName")
 
     if ($LASTEXITCODE -ne 0) {
         Write-LogError "Falha ao iniciar scan SAST+SCA para $RepoName"

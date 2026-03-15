@@ -15,6 +15,7 @@
 # ============================================================================
 
 $script:LogFile = $null
+$script:FcliSessionParams = $null
 
 function Initialize-LogFile {
     param(
@@ -288,6 +289,13 @@ function Connect-FodSession {
 
     Write-LogStep "Conectando ao Fortify on Demand"
 
+    $script:FcliSessionParams = @{
+        Fcli        = $Fcli
+        FodUrl      = $FodUrl
+        ClientId    = $ClientId
+        ClientSecret = $ClientSecret
+    }
+
     & $Fcli fod session login `
         --url $FodUrl `
         --client-id $ClientId `
@@ -299,6 +307,46 @@ function Connect-FodSession {
     }
 
     Write-LogInfo "Conectado ao FoD com sucesso"
+}
+
+function Invoke-FcliCommand {
+    <#
+    .SYNOPSIS
+        Executa um comando fcli com renovacao automatica de sessao FoD.
+    .PARAMETER Arguments
+        Array de argumentos a passar ao fcli (sem o executavel).
+    .PARAMETER Silent
+        Suprime a saida para o host; util quando o resultado sera parseado.
+    #>
+    param(
+        [Parameter(Mandatory)] [string[]]$Arguments,
+        [switch]$Silent
+    )
+
+    $p = $script:FcliSessionParams
+    if (-not $p) { throw 'FoD session not initialized. Call Connect-FodSession first.' }
+
+    $lines = & $p.Fcli @Arguments 2>&1
+    $ec    = $LASTEXITCODE
+
+    if (($lines | Out-String) -match 'FcliNoSessionException') {
+        Write-LogWarn 'Sessao FoD expirada. Reconectando e tentando novamente...'
+        & $p.Fcli fod session login `
+            --url $p.FodUrl `
+            --client-id $p.ClientId `
+            --client-secret $p.ClientSecret 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-LogError 'Falha ao reconectar ao FoD'
+        } else {
+            Write-LogInfo 'Reconectado ao FoD com sucesso. Tentando novamente...'
+            $lines = & $p.Fcli @Arguments 2>&1
+            $ec    = $LASTEXITCODE
+        }
+    }
+
+    if (-not $Silent) { $lines | Out-Host }
+    $global:LASTEXITCODE = $ec
+    return $lines
 }
 
 function Disconnect-FodSession {
